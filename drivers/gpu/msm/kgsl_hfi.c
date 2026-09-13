@@ -445,6 +445,9 @@ static int hfi_send_dcvstbl_v1(struct gmu_device *gmu)
 	};
 	int i;
 
+	if (gmu->num_gpupwrlevels > MAX_GX_LEVELS)
+		return -EINVAL;
+
 	for (i = 0; i < gmu->num_gpupwrlevels; i++) {
 		cmd.gx_votes[i].vote = gmu->rpmh_votes.gx_votes[i];
 		/* Divide by 1000 to convert to kHz */
@@ -488,6 +491,9 @@ static int hfi_send_dcvstbl(struct gmu_device *gmu)
 		.gmu_level_num = GMU_PWR_LEVELS,
 	};
 	int i;
+
+	if (gmu->num_gpupwrlevels > MAX_GX_LEVELS)
+		return -EINVAL;
 
 	for (i = 0; i < gmu->num_gpupwrlevels; i++) {
 		cmd.gx_votes[i].vote = gmu->rpmh_votes.gx_votes[i];
@@ -809,6 +815,10 @@ int hfi_send_req(struct gmu_device *gmu, unsigned int id, void *data)
 	switch (id) {
 	case H2F_MSG_GX_BW_PERF_VOTE: {
 		struct hfi_gx_bw_perf_vote_cmd *cmd = data;
+
+		if ((cmd->freq != INVALID_DCVS_IDX && cmd->freq >= MAX_GX_LEVELS) ||
+			(cmd->bw != INVALID_DCVS_IDX && cmd->bw >= MAX_GX_LEVELS))
+			return -EINVAL;
 
 		cmd->hdr = CMD_MSG_HDR(id, sizeof(*cmd));
 

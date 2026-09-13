@@ -31,7 +31,8 @@ struct kgsl_device;
 #define KGSL_MAX_CLKS 18
 #define KGSL_MAX_REGULATORS 2
 
-#define KGSL_MAX_PWRLEVELS 10
+/* Matches GMU/HFI MAX_GX_LEVELS: 15 active GPU OPPs plus sleep. */
+#define KGSL_MAX_PWRLEVELS 16
 
 /* Only two supported levels, min & max */
 #define KGSL_CONSTRAINT_PWR_MAXLEVELS 2

@@ -782,7 +782,22 @@ static int setup_volt_dependency_tbl(uint32_t *votes,
 			}
 		}
 
-		/* If we did not find a matching VLVL level then abort */
+		/*
+		 * Older command-db mappings may not expose newer symbolic corners
+		 * such as TURBO_L1. Match regulator ARC behavior and fall back to
+		 * the highest supported non-zero corner instead of failing GMU init.
+		 */
+		if (!found_match) {
+			for (k = pri_rail->num; k > 0; k--) {
+				if (pri_rail->val[k - 1] != 0) {
+					k--;
+					cur_vlvl = pri_rail->val[k];
+					found_match = true;
+					break;
+				}
+			}
+		}
+
 		if (!found_match)
 			return -EINVAL;
 
@@ -843,9 +858,9 @@ static int rpmh_arc_votes_init(struct kgsl_device *device,
 	num_freqs = gmu->num_gpupwrlevels;
 	freq_tbl = gmu->gpu_freqs;
 
-	if (num_freqs > pri_rail->num || num_freqs > MAX_GX_LEVELS) {
+	if (num_freqs > MAX_GX_LEVELS) {
 		dev_err(&gmu->pdev->dev,
-			"Defined more GPU DCVS levels than RPMh can support\n");
+			"Defined more GPU DCVS levels than GMU HFI can support\n");
 		return -EINVAL;
 	}
 
@@ -1937,7 +1952,13 @@ static void gmu_acd_probe(struct kgsl_device *device, struct gmu_device *gmu,
 	for (i = 0, cmd_idx = 0; i < numlvl; i++) {
 		acd_level = pwr->pwrlevels[numlvl - i - 1].acd_level;
 		if (acd_level) {
-			cmd->enable_by_level |= (1 << i);
+			if (cmd_idx >= ARRAY_SIZE(cmd->data)) {
+				dev_err(&gmu->pdev->dev,
+					"Too many GPU ACD levels: %u > %zu\n",
+					cmd_idx + 1, ARRAY_SIZE(cmd->data));
+				break;
+			}
+			cmd->enable_by_level |= BIT(i);
 			cmd->data[cmd_idx++] = acd_level;
 		}
 	}
@@ -2032,6 +2053,15 @@ static int gmu_probe(struct kgsl_device *device, struct device_node *node)
 
 	tasklet_init(&hfi->tasklet, hfi_receiver, (unsigned long) gmu);
 	hfi->kgsldev = device;
+
+	BUILD_BUG_ON(KGSL_MAX_PWRLEVELS > MAX_GX_LEVELS);
+	if (pwr->num_pwrlevels > MAX_GX_LEVELS) {
+		dev_err(&gmu->pdev->dev,
+			"Too many GPU power levels: %u > %u\n",
+			pwr->num_pwrlevels, MAX_GX_LEVELS);
+		ret = -EINVAL;
+		goto error;
+	}
 
 	gmu->num_gpupwrlevels = pwr->num_pwrlevels;
 
