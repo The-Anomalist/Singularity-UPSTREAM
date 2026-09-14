@@ -410,16 +410,7 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq)
 	 * If there is an extended block of busy processing,
 	 * increase frequency.  Otherwise run the normal algorithm.
 	 */
-	if (!priv->tz_available) {
-		u32 load = div64_u64((u64)priv->bin.busy_time * 100,
-			priv->bin.total_time);
-
-		val = 0;
-		if (load >= 85)
-			val = -1;
-		else if (load <= 25)
-			val = 1;
-	} else if (!priv->disable_busy_time_burst &&
+	if (!priv->disable_busy_time_burst &&
 			priv->bin.busy_time > CEILING) {
 		val = -1 * level;
 	} else {
@@ -483,7 +474,7 @@ static int tz_start(struct devfreq *devfreq)
 	struct devfreq_msm_adreno_tz_data *priv;
 	unsigned int tz_pwrlevels[MSM_ADRENO_MAX_PWRLEVELS + 1];
 	int i, out, ret;
-	unsigned int version = 0;
+	unsigned int version;
 	struct msm_adreno_extended_profile *gpu_profile;
 
 	if (partner_gpu_profile)
@@ -525,21 +516,12 @@ static int tz_start(struct devfreq *devfreq)
 	INIT_WORK(&gpu_profile->partner_resume_event_ws,
 					do_partner_resume_event);
 
-	if (devfreq->profile->max_state > 9) {
-		pr_info(TAG "using software governor path for expanded GPU table\n");
-		priv->tz_available = false;
-		ret = 0;
-	} else {
-		ret = tz_init(priv, tz_pwrlevels, sizeof(tz_pwrlevels), &version,
+	ret = tz_init(priv, tz_pwrlevels, sizeof(tz_pwrlevels), &version,
 				sizeof(version));
-	}
-
 	if (ret != 0 || version > MAX_TZ_VERSION) {
-		pr_warn(TAG "tz_init failed, using software governor path\n");
-		priv->tz_available = false;
-		ret = 0;
-	} else if (devfreq->profile->max_state <= 9) {
-		priv->tz_available = true;
+		pr_err(TAG "tz_init failed\n");
+		partner_gpu_profile = NULL;
+		return ret;
 	}
 
 	for (i = 0; adreno_tz_attr_list[i] != NULL; i++)

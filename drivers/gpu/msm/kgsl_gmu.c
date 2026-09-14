@@ -645,6 +645,10 @@ static int gmu_dcvs_set(struct kgsl_device *device,
 		return 0;
 	}
 
+	dev_info_ratelimited(&gmu->pdev->dev,
+		"GMU DCVS request gpu_pwrlevel=%u perf_idx=%u bus_level=%u bw_idx=%u\n",
+		gpu_pwrlevel, req.freq, bus_level, req.bw);
+
 	if (ADRENO_QUIRK(adreno_dev, ADRENO_QUIRK_HFI_USE_REG))
 		ret = gmu_dev_ops->rpmh_gpu_pwrctrl(device,
 			GMU_DCVS_NOHFI, req.freq, req.bw);

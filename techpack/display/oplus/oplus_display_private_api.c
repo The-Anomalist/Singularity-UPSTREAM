@@ -2242,7 +2242,9 @@ static ssize_t oplus_display_notify_fp_press(struct kobject *obj,
 		}
 
 		set_mode = oplus_display_mode ? vid_mode : cmd_mode;
-		set_mode = onscreenfp_status ? vid_mode : set_mode;
+		if (onscreenfp_status)
+			set_mode = (drm_mode_vrefresh(cur_mode) == 90) ?
+				cur_mode : vid_mode;
 		if (!crtc_state->active || !crtc_state->enable)
 			goto error;
 
