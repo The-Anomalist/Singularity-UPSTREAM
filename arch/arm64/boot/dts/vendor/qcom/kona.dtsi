@@ -1331,6 +1331,20 @@
 		operating-points-v2 = <&ddr_bw_opp_table>;
 	};
 
+	cpu7_cpu_ddr_latfloor: qcom,cpu7-cpu-ddr-latfloor {
+		compatible = "qcom,devbw-ddr";
+		governor = "performance";
+		interconnects = <&kona_icc KONA_ICC_CPU7_TO_MEM>;
+		interconnect-names = "cpu-ddr";
+		qcom,icc-boost-percent = <145>;
+		qcom,icc-min-avg-kbps = <6000000>;
+		qcom,icc-min-peak-kbps = <12000000>;
+		qcom,src-dst-ports =
+			<MSM_BUS_MASTER_LLCC MSM_BUS_SLAVE_EBI_CH0>;
+		qcom,active-only;
+		operating-points-v2 = <&ddr_bw_opp_table>;
+	};
+
 	qoslat_opp_table: qoslat-opp-table {
 		compatible = "operating-points-v2";
 		opp-0 {
@@ -1520,7 +1534,35 @@
 
 		cpu4_computemon: qcom,cpu4-computemon {
 			compatible = "qcom,arm-compute-mon";
+			qcom,cpulist = <&CPU4 &CPU5 &CPU6>;
 			qcom,target-dev = <&cpu4_cpu_ddr_latfloor>;
+			ddr4-map {
+				qcom,ddr-type = <DDR_TYPE_LPDDR4X>;
+				qcom,core-dev-table =
+					< 1804800 MHZ_TO_MBPS( 200, 4) >,
+					< 2380800 MHZ_TO_MBPS(1017, 4) >,
+					< 2500000 MHZ_TO_MBPS(1804, 4) >,
+					< 2525000 MHZ_TO_MBPS(2092, 4) >,
+					< 2841600 MHZ_TO_MBPS(2092, 4) >,
+					< 2956800 MHZ_TO_MBPS(2092, 4) >;
+			};
+
+			ddr5-map {
+				qcom,ddr-type = <DDR_TYPE_LPDDR5>;
+				qcom,core-dev-table =
+					< 1804800 MHZ_TO_MBPS( 200, 4) >,
+					< 2380800 MHZ_TO_MBPS(1017, 4) >,
+					< 2500000 MHZ_TO_MBPS(2368, 4) >,
+					< 2525000 MHZ_TO_MBPS(2736, 4) >,
+					< 2841600 MHZ_TO_MBPS(2736, 4) >,
+					< 2956800 MHZ_TO_MBPS(2736, 4) >;
+			};
+		};
+
+		cpu7_computemon: qcom,cpu7-computemon {
+			compatible = "qcom,arm-compute-mon";
+			qcom,cpulist = <&CPU7>;
+			qcom,target-dev = <&cpu7_cpu_ddr_latfloor>;
 			ddr4-map {
 				qcom,ddr-type = <DDR_TYPE_LPDDR4X>;
 				qcom,core-dev-table =
