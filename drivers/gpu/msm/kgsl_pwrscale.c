@@ -836,7 +836,7 @@ int kgsl_devfreq_target(struct device *dev, unsigned long *freq, u32 flags)
 		}
 
 		if (level != active_level)
-			kgsl_pwrctrl_pwrlevel_change(device, level);
+			kgsl_pwrctrl_pwrlevel_change_devfreq(device, level);
 	} else if (popp_stable(device)) {
 		popp_trans1(device);
 	}
@@ -1358,8 +1358,25 @@ int kgsl_pwrscale_init(struct device *dev, const char *governor)
 				kgsl_pwrscale_midframe_timer_check);
 
 	devfreq = devfreq_add_device(dev, &pwrscale->gpu_profile.profile,
-			governor, pwrscale->gpu_profile.private_data);
+			governor, !strcmp(governor, "simple_ondemand") ? NULL :
+			pwrscale->gpu_profile.private_data);
+	if (IS_ERR(devfreq) && strcmp(governor, "msm-adreno-tz")) {
+		dev_warn(device->dev,
+			"Failed to start GPU devfreq governor %s (%ld), trying msm-adreno-tz\n",
+			governor, PTR_ERR(devfreq));
+		devfreq = devfreq_add_device(dev, &pwrscale->gpu_profile.profile,
+			"msm-adreno-tz", pwrscale->gpu_profile.private_data);
+	}
+	if (IS_ERR(devfreq) && strcmp(governor, "simple_ondemand")) {
+		dev_warn(device->dev,
+			"Failed to start GPU devfreq fallback governor (%ld), trying simple_ondemand\n",
+			PTR_ERR(devfreq));
+		devfreq = devfreq_add_device(dev, &pwrscale->gpu_profile.profile,
+			"simple_ondemand", NULL);
+	}
 	if (IS_ERR(devfreq)) {
+		dev_err(device->dev, "Failed to start GPU devfreq: %ld\n",
+			PTR_ERR(devfreq));
 		device->pwrscale.enabled = false;
 		pwrscale->midframe_enabled = false;
 		destroy_workqueue(pwrscale->devfreq_wq);
