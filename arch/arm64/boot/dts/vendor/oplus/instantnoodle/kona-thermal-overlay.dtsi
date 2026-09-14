@@ -19,7 +19,7 @@
 
 			vbat_gpu0 {
 				trip = <&b_bcl_lvl0>;
-				cooling-device = <&msm_gpu 2 2>;
+				cooling-device = <&msm_gpu 10 10>;
 			};
 		};
 	};
@@ -38,7 +38,7 @@
 
 			vbat_gpu1 {
 				trip = <&b_bcl_lvl1>;
-				cooling-device = <&msm_gpu 4 4>;
+				cooling-device = <&msm_gpu 11 11>;
 			};
 		};
 	};
@@ -68,7 +68,7 @@
 
 			vph_gpu0 {
 				trip = <&l_bcl_lvl0>;
-				cooling-device = <&msm_gpu 2 2>;
+				cooling-device = <&msm_gpu 10 10>;
 			};
 		};
 	};
@@ -88,7 +88,7 @@
 
 			vph_gpu1 {
 				trip = <&l_bcl_lvl1>;
-				cooling-device = <&msm_gpu 4 4>;
+				cooling-device = <&msm_gpu 11 11>;
 			};
 		};
 	};

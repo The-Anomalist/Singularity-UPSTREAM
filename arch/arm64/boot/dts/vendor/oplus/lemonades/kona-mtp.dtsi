@@ -96,6 +96,67 @@
 	status = "ok";
 };
 
+
+/*
+ * Keep GPU memory/cfg paths responsive for foreground animation, but avoid
+ * pinning the fabric at benchmark-style floors all day.
+ */
+&gpubw {
+	qcom,icc-boost-percent = <160>;
+	qcom,icc-upscale-percent = <250>;
+	qcom,polling-ms = <8>;
+	qcom,icc-min-avg-kbps = <4218750>;
+	qcom,icc-min-peak-kbps = <16875000>;
+};
+
+&msm_gpu {
+	qcom,pm-qos-active-latency = <20>;
+	qcom,ca-busy-penalty = <10000>;
+	qcom,ca-target-pwrlevel = <1>;
+	qcom,tz-sample-floor = <2500>;
+	qcom,tz-min-busy = <550>;
+	qcom,tz-busy-ceiling = <28000>;
+	qcom,gpu-icc-bw-avg-kbps =
+		<1 390625 585937 878906 1113281 1406250 1757812
+		 2109375 2812500 3375000 4218750 4921875 5625000 6328125>;
+	qcom,gpu-icc-bw-peak-kbps =
+		<1 1562500 2343750 3515625 4453125 5625000 7031250
+		 8437500 11250000 13500000 16875000 19687500 22500000 25312500>;
+	qcom,gpu-cfg-icc-bw-avg-kbps = <1 64>;
+	qcom,gpu-cfg-icc-bw-peak-kbps = <1 256>;
+};
+
+/*
+ * Keep app-launch I/O from stalling, but drop the sustained storage fabric
+ * vote below the previous benchmark-oriented floor.
+ */
+&ufshc_mem {
+	qcom,icc-min-avg-kbps = <900000>;
+	qcom,icc-min-peak-kbps = <5000000>;
+	qcom,icc-boost-percent = <130>;
+	qcom,icc-upscale-percent = <200>;
+	qcom,polling-ms = <8>;
+};
+
+/*
+ * Raise CPAS/CAMNOC baseline headroom for heavy camera pipelines.
+ * This reduces under-voting during fast mode switches and helps
+ * preserve frame quality under sustained multi-stream load.
+ */
+&{/soc/qcom,cam-cpas@ac40000} {
+	camnoc-axi-min-ib-bw = <3600000000>;
+	camnoc-axi-clk-bw-margin-perc = <28>;
+};
+
+/*
+ * Keep USB wake/interrupt response tighter for foreground interaction
+ * and mixed Singularity I/O runs.
+ */
+&usb0 {
+	qcom,pm-qos-latency = <41>;
+};
+
+
 &soc {
 	gpio_keys {
 		compatible = "gpio-keys";
@@ -658,7 +719,7 @@
 	skin-therm {
 		polling-delay-passive = <0>;
 		polling-delay = <0>;
-		thermal-governor = "smooth_step";
+		thermal-governor = "step_wise";
 		thermal-sensors = <&pm8150b_adc_tm ADC_AMUX_THM1_PU2>;
 		wake-capable-sensor;
 	};
