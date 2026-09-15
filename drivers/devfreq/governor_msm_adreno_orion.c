@@ -66,6 +66,21 @@ static void do_partner_resume_event(struct work_struct *work);
 
 static struct workqueue_struct *workqueue;
 
+static inline u32 tz_sample_floor(struct devfreq_msm_adreno_tz_data *priv)
+{
+	return priv->tz_sample_floor ?: FLOOR;
+}
+
+static inline u32 tz_min_busy(struct devfreq_msm_adreno_tz_data *priv)
+{
+	return priv->tz_min_busy ?: MIN_BUSY;
+}
+
+static inline u32 tz_busy_ceiling(struct devfreq_msm_adreno_tz_data *priv)
+{
+	return priv->tz_busy_ceiling ?: CEILING;
+}
+
 
 /*
  * Orion combines the firmware recommendation with a local, continuously
@@ -581,7 +596,8 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq)
 	 * still useful: it feeds Orion's downscale hysteresis without paying for
 	 * a TrustZone transaction.
 	 */
-	if (stats->total_time == 0 || priv->bin.total_time < FLOOR)
+	if (stats->total_time == 0 ||
+		priv->bin.total_time < tz_sample_floor(priv))
 		return 0;
 
 	level = devfreq_get_freq_level(devfreq, stats->current_frequency);
@@ -590,7 +606,7 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq)
 		return level;
 	}
 
-	if ((unsigned int)priv->bin.busy_time < MIN_BUSY) {
+	if ((unsigned int)priv->bin.busy_time < tz_min_busy(priv)) {
 		sample_total = priv->bin.total_time;
 		sample_busy = priv->bin.busy_time;
 		priv->bin.total_time = 0;
@@ -605,8 +621,10 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq)
 	 * If there is an extended block of busy processing,
 	 * increase frequency.  Otherwise run the normal algorithm.
 	 */
-	if (!priv->disable_busy_time_burst &&
-			priv->bin.busy_time > CEILING) {
+	if (!priv->tz_available) {
+		val = 0;
+	} else if (!priv->disable_busy_time_burst &&
+			priv->bin.busy_time > tz_busy_ceiling(priv)) {
 		val = -1 * level;
 	} else {
 		unsigned int refresh_rate = dsi_panel_get_refresh_rate();
@@ -678,7 +696,7 @@ static int tz_start(struct devfreq *devfreq)
 	struct devfreq_msm_adreno_tz_data *priv;
 	unsigned int tz_pwrlevels[MSM_ADRENO_MAX_PWRLEVELS + 1];
 	int i, out, ret;
-	unsigned int version;
+	unsigned int version = 0;
 	struct msm_adreno_extended_profile *gpu_profile;
 
 	if (partner_gpu_profile)
@@ -702,14 +720,16 @@ static int tz_start(struct devfreq *devfreq)
 	priv->nb.notifier_call = tz_notify;
 
 	out = 1;
-	if (devfreq->profile->max_state <= MSM_ADRENO_MAX_PWRLEVELS) {
+	if (devfreq->profile->max_state > 9) {
+		pr_info(TAG "using software governor path for expanded GPU table\n");
+		priv->tz_available = false;
+		ret = 0;
+	} else {
 		for (i = 0; i < devfreq->profile->max_state; i++)
 			tz_pwrlevels[out++] = devfreq->profile->freq_table[i];
 		tz_pwrlevels[0] = i;
-	} else {
-		pr_err(TAG "tz_pwrlevels[] is too short\n");
-		partner_gpu_profile = NULL;
-		return -EINVAL;
+		ret = tz_init(priv, tz_pwrlevels, sizeof(tz_pwrlevels), &version,
+				sizeof(version));
 	}
 
 	INIT_WORK(&gpu_profile->partner_start_event_ws,
@@ -721,12 +741,12 @@ static int tz_start(struct devfreq *devfreq)
 	INIT_WORK(&gpu_profile->partner_resume_event_ws,
 					do_partner_resume_event);
 
-	ret = tz_init(priv, tz_pwrlevels, sizeof(tz_pwrlevels), &version,
-				sizeof(version));
 	if (ret != 0 || version > MAX_TZ_VERSION) {
-		pr_err(TAG "tz_init failed\n");
-		partner_gpu_profile = NULL;
-		return ret;
+		pr_warn(TAG "tz_init failed, using software governor path\n");
+		priv->tz_available = false;
+		ret = 0;
+	} else if (devfreq->profile->max_state <= 9) {
+		priv->tz_available = true;
 	}
 
 	for (i = 0; adreno_tz_attr_list[i] != NULL; i++)

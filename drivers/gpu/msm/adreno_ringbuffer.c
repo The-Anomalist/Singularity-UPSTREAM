@@ -124,6 +124,7 @@ static void adreno_ringbuffer_wptr(struct adreno_device *adreno_dev,
 	}
 
 	rb->wptr = rb->_wptr;
+	rb->wptr_pending = false;
 	spin_unlock_irqrestore(&rb->preempt_lock, flags);
 
 	if (ret) {
@@ -194,6 +195,14 @@ void adreno_ringbuffer_submit(struct adreno_ringbuffer *rb,
 	}
 
 	adreno_ringbuffer_wptr(adreno_dev, rb);
+}
+
+void adreno_ringbuffer_flush(struct adreno_ringbuffer *rb)
+{
+	struct adreno_device *adreno_dev = ADRENO_RB_DEVICE(rb);
+
+	if (rb->wptr_pending)
+		adreno_ringbuffer_wptr(adreno_dev, rb);
 }
 
 int adreno_ringbuffer_submit_spin_nosync(struct adreno_ringbuffer *rb,
@@ -486,7 +495,7 @@ static int
 adreno_ringbuffer_addcmds(struct adreno_ringbuffer *rb,
 				unsigned int flags, unsigned int *cmds,
 				unsigned int sizedwords, uint32_t timestamp,
-				struct adreno_submit_time *time)
+				struct adreno_submit_time *time, bool defer_wptr)
 {
 	struct adreno_device *adreno_dev = ADRENO_RB_DEVICE(rb);
 	struct adreno_gpudev *gpudev = ADRENO_GPU_DEVICE(adreno_dev);
@@ -806,7 +815,15 @@ adreno_ringbuffer_addcmds(struct adreno_ringbuffer *rb,
 	 */
 	rb->_wptr = rb->_wptr - (total_sizedwords - (ringcmds - start));
 
-	adreno_ringbuffer_submit(rb, time);
+	if (defer_wptr) {
+		if (time != NULL) {
+			adreno_get_submit_time(adreno_dev, rb, time);
+			adreno_profile_submit_time(time);
+		}
+		rb->wptr_pending = true;
+	} else {
+		adreno_ringbuffer_submit(rb, time);
+	}
 
 	return 0;
 }
@@ -820,7 +837,7 @@ adreno_ringbuffer_issue_internal_cmds(struct adreno_ringbuffer *rb,
 	flags |= KGSL_CMD_FLAGS_INTERNAL_ISSUE;
 
 	return adreno_ringbuffer_addcmds(rb, flags, cmds,
-		sizedwords, 0, NULL);
+		sizedwords, 0, NULL, false);
 }
 
 static void adreno_ringbuffer_set_constraint(struct kgsl_device *device,
@@ -964,7 +981,7 @@ static int set_user_profiling(struct adreno_device *adreno_dev,
 /* adreno_rindbuffer_submitcmd - submit userspace IBs to the GPU */
 int adreno_ringbuffer_submitcmd(struct adreno_device *adreno_dev,
 		struct kgsl_drawobj_cmd *cmdobj,
-		struct adreno_submit_time *time)
+		struct adreno_submit_time *time, bool defer_wptr)
 {
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 	struct adreno_gpudev *gpudev = ADRENO_GPU_DEVICE(adreno_dev);
@@ -1219,7 +1236,7 @@ int adreno_ringbuffer_submitcmd(struct adreno_device *adreno_dev,
 
 	ret = adreno_ringbuffer_addcmds(rb, flags,
 					&link[0], (cmds - link),
-					drawobj->timestamp, time);
+					drawobj->timestamp, time, defer_wptr);
 
 	if (!ret) {
 		set_bit(KGSL_CONTEXT_PRIV_SUBMITTED, &context->priv);

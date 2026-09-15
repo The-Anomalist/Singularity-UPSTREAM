@@ -275,13 +275,17 @@ static void _ab_buslevel_update(struct kgsl_pwrctrl *pwr,
  */
 static unsigned int _adjust_pwrlevel(struct kgsl_pwrctrl *pwr, int level,
 					struct kgsl_pwr_constraint *pwrc,
-					int popp)
+					int popp, bool user_limits)
 {
-	unsigned int max_pwrlevel = max_t(unsigned int, pwr->thermal_pwrlevel,
+	unsigned int max_pwrlevel = pwr->thermal_pwrlevel;
+	unsigned int min_pwrlevel = pwr->thermal_pwrlevel_floor;
+
+	if (user_limits) {
+		max_pwrlevel = max_t(unsigned int, max_pwrlevel,
 					pwr->max_pwrlevel);
-	unsigned int min_pwrlevel = min_t(unsigned int,
-					pwr->thermal_pwrlevel_floor,
+		min_pwrlevel = min_t(unsigned int, min_pwrlevel,
 					pwr->min_pwrlevel);
+	}
 
 	/* Ensure that max/min pwrlevels are within thermal max/min limits */
 	max_pwrlevel = min_t(unsigned int, max_pwrlevel,
@@ -938,7 +942,7 @@ unsigned int kgsl_pwrctrl_adjust_pwrlevel(struct kgsl_device *device,
 	 * constraints, etc
 	 */
 	return _adjust_pwrlevel(pwr, new_level, &pwr->constraint,
-					device->pwrscale.popp_level);
+					device->pwrscale.popp_level, true);
 }
 
 /**
@@ -1066,6 +1070,26 @@ void kgsl_pwrctrl_pwrlevel_change(struct kgsl_device *device,
 EXPORT_SYMBOL(kgsl_pwrctrl_pwrlevel_change);
 
 /**
+ * kgsl_pwrctrl_pwrlevel_change_devfreq - Change power level for devfreq
+ * @device: Pointer to the kgsl_device struct
+ * @new_level: Requested powerlevel, an index into the pwrlevel array
+ *
+ * Validate and change power levels when called from devfreq, using user
+ * limits rather than thermal limits.  Check that any power level constraints
+ * are still valid.  Update the requested level according to any thermal,
+ * max/min, or power constraints.  If a new GPU level is going to be set,
+ * update the bus to that level's default value.  Do not change the bus if
+ * a constraint keeps the new level at the current level.  Set the new GPU
+ * frequency.
+ */
+void kgsl_pwrctrl_pwrlevel_change_devfreq(struct kgsl_device *device,
+				unsigned int new_level)
+{
+	kgsl_pwrctrl_pwrlevel_change(device, new_level);
+}
+EXPORT_SYMBOL(kgsl_pwrctrl_pwrlevel_change_devfreq);
+
+/**
  * kgsl_pwrctrl_set_constraint() - Validate and change enforced constraint
  * @device: Pointer to the kgsl_device struct
  * @pwrc: Pointer to requested constraint
@@ -1085,7 +1109,7 @@ void kgsl_pwrctrl_set_constraint(struct kgsl_device *device,
 	if (device == NULL || pwrc == NULL)
 		return;
 	constraint = _adjust_pwrlevel(&device->pwrctrl,
-				device->pwrctrl.active_pwrlevel, pwrc, 0);
+				device->pwrctrl.active_pwrlevel, pwrc, 0, true);
 	pwrc_old = &device->pwrctrl.constraint;
 
 	/*

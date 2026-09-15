@@ -116,9 +116,7 @@
 
 		qcom,pm-qos-active-latency = <44>;
 
-		qcom,enable-ca-jump;
 		qcom,ca-busy-penalty = <9000>;
-		qcom,ca-target-pwrlevel = <1>;
 		qcom,enable-midframe-timer;
 		qcom,wakeup-boost-ms = <50>;
 		qcom,wakeup-boost-pwrlevel = <1>;

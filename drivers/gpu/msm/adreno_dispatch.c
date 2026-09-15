@@ -568,7 +568,7 @@ static void  dispatcher_queue_context(struct adreno_device *adreno_dev,
  * Send a KGSL drawobj to the GPU hardware
  */
 static int sendcmd(struct adreno_device *adreno_dev,
-	struct kgsl_drawobj_cmd *cmdobj)
+	struct kgsl_drawobj_cmd *cmdobj, bool defer_wptr)
 {
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 	struct kgsl_drawobj *drawobj = DRAWOBJ(cmdobj);
@@ -615,7 +615,12 @@ static int sendcmd(struct adreno_device *adreno_dev,
 			ADRENO_DRAWOBJ_PROFILE_COUNT;
 	}
 
-	ret = adreno_ringbuffer_submitcmd(adreno_dev, cmdobj, &time);
+	/* Preserve exact profiling submit timing and first-idle wake semantics. */
+	defer_wptr = defer_wptr && dispatcher->inflight > 1 &&
+		!test_bit(CMDOBJ_PROFILE, &cmdobj->priv) &&
+		!(drawobj->flags & KGSL_DRAWOBJ_PROFILING);
+
+	ret = adreno_ringbuffer_submitcmd(adreno_dev, cmdobj, &time, defer_wptr);
 
 	/*
 	 * On the first command, if the submission was successful, then read the
@@ -716,9 +721,26 @@ static int sendcmd(struct adreno_device *adreno_dev,
 	 * we just submitted something, readjust ringbuffer
 	 * execution level
 	 */
-	if (gpudev->preemption_schedule)
+	if (!defer_wptr && gpudev->preemption_schedule)
 		gpudev->preemption_schedule(adreno_dev);
 	return 0;
+}
+
+static void dispatcher_flush_ringbuffer(struct adreno_device *adreno_dev,
+		struct adreno_ringbuffer *rb)
+{
+	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
+	struct adreno_gpudev *gpudev = ADRENO_GPU_DEVICE(adreno_dev);
+
+	if (!rb || !rb->wptr_pending)
+		return;
+
+	mutex_lock(&device->mutex);
+	adreno_ringbuffer_flush(rb);
+	mutex_unlock(&device->mutex);
+
+	if (gpudev->preemption_schedule)
+		gpudev->preemption_schedule(adreno_dev);
 }
 
 
@@ -810,6 +832,7 @@ static int dispatcher_context_sendcmds(struct adreno_device *adreno_dev,
 	int inflight = _drawqueue_inflight(dispatch_q);
 	unsigned int burst = _drawqueue_burst(dispatch_q, inflight);
 	unsigned int timestamp;
+	bool deferred_wptr = false;
 
 	if (drawctxt->base.flags & KGSL_CONTEXT_SPARSE)
 		return _process_drawqueue_sparse(drawctxt);
@@ -853,7 +876,7 @@ static int dispatcher_context_sendcmds(struct adreno_device *adreno_dev,
 
 		timestamp = drawobj->timestamp;
 		cmdobj = CMDOBJ(drawobj);
-		ret = sendcmd(adreno_dev, cmdobj);
+		ret = sendcmd(adreno_dev, cmdobj, count + 1 < burst);
 
 		/*
 		 * On error from sendcmd() try to requeue the cmdobj
@@ -861,6 +884,9 @@ static int dispatcher_context_sendcmds(struct adreno_device *adreno_dev,
 		 * been detached and there will be no more deliveries from here
 		 */
 		if (ret != 0) {
+			dispatcher_flush_ringbuffer(adreno_dev, drawctxt->rb);
+			deferred_wptr = false;
+
 			/* Destroy the cmdobj on -ENOENT */
 			if (ret == -ENOENT)
 				kgsl_drawobj_destroy(drawobj);
@@ -879,9 +905,13 @@ static int dispatcher_context_sendcmds(struct adreno_device *adreno_dev,
 		}
 
 		drawctxt->submitted_timestamp = timestamp;
+		deferred_wptr |= drawctxt->rb->wptr_pending;
 
 		count++;
 	}
+
+	if (deferred_wptr)
+		dispatcher_flush_ringbuffer(adreno_dev, drawctxt->rb);
 
 	/*
 	 * Wake up any snoozing threads if we have consumed any real commands
@@ -2109,7 +2139,7 @@ replay:
 
 		set_bit(CMDOBJ_WFI, &replay[i]->priv);
 
-		ret = sendcmd(adreno_dev, replay[i]);
+		ret = sendcmd(adreno_dev, replay[i], false);
 
 		/*
 		 * If sending the command fails, then try to recover by

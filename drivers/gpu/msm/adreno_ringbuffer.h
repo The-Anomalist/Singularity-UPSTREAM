@@ -98,6 +98,8 @@ struct adreno_ringbuffer_pagetable_info {
  * @preempt_lock: Lock to protect the wptr pointer while it is being updated
  * @skip_inline_wptr: Used during preemption to make sure wptr is updated in
  * hardware
+ * @wptr_pending: New commands are present in the ringbuffer but WPTR has not
+ * been written to hardware yet
  */
 struct adreno_ringbuffer {
 	uint32_t flags;
@@ -121,6 +123,7 @@ struct adreno_ringbuffer {
 	int preempted_midway;
 	spinlock_t preempt_lock;
 	bool skip_inline_wptr;
+	bool wptr_pending;
 	/**
 	 * @profile_desc: global memory to construct IB1s to do user side
 	 * profiling
@@ -147,7 +150,7 @@ int adreno_ringbuffer_issueibcmds(struct kgsl_device_private *dev_priv,
 
 int adreno_ringbuffer_submitcmd(struct adreno_device *adreno_dev,
 		struct kgsl_drawobj_cmd *cmdobj,
-		struct adreno_submit_time *time);
+		struct adreno_submit_time *time, bool defer_wptr);
 
 int adreno_ringbuffer_probe(struct adreno_device *adreno_dev);
 
@@ -164,6 +167,8 @@ int adreno_ringbuffer_issue_internal_cmds(struct adreno_ringbuffer *rb,
 
 void adreno_ringbuffer_submit(struct adreno_ringbuffer *rb,
 		struct adreno_submit_time *time);
+
+void adreno_ringbuffer_flush(struct adreno_ringbuffer *rb);
 
 int adreno_ringbuffer_submit_spin_nosync(struct adreno_ringbuffer *rb,
 		struct adreno_submit_time *time, unsigned int timeout);
