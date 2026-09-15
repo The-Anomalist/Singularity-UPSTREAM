@@ -19,7 +19,6 @@
 #include <linux/kdev_t.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
-#include <linux/list.h>
 #include <linux/math64.h>
 #include <linux/minmax.h>
 #include <linux/overflow.h>
@@ -714,16 +713,6 @@ static struct kona_ipa_shadow_state kona_ipa_shadow = {
 };
 
 struct kona_icc_provider;
-
-struct kona_icc_client_vote {
-	struct list_head node;
-	struct kona_icc_provider *qp;
-	unsigned int index;
-	u64 avg_bw;
-	u64 peak_bw;
-	u32 tag;
-	bool valid;
-};
 
 static int kona_icc_commit_ipa_bcms(
 		struct kona_icc_provider *qp,
@@ -1456,7 +1445,6 @@ struct kona_icc_provider {
 	atomic_t votes_paused;
 	/* Serialize logical-path updates that share a physical RPMh BCM. */
 	struct mutex vote_lock;
-	struct list_head client_votes;
 	u64 *last_ab;
 	u64 *last_ib;
 	u64 *req_ab;
@@ -4037,7 +4025,6 @@ static const struct kona_icc_data kona_data = {
 
 static const struct kona_icc_node_desc *
 kona_find_desc(struct kona_icc_provider *qp, u32 id, unsigned int *index);
-static void kona_icc_release(struct icc_path *path);
 
 static int kona_icc_validate_display_nodes(struct kona_icc_provider *qp)
 {
@@ -4088,61 +4075,11 @@ kona_find_desc(struct kona_icc_provider *qp, u32 id, unsigned int *index)
 	return NULL;
 }
 
-static u32 kona_icc_client_effective_tag(u32 tag)
-{
-	return tag ? tag : KONA_SHADOW_TAG_ALWAYS;
-}
-
-static void kona_icc_aggregate_node_clients(struct kona_icc_provider *qp,
-						   unsigned int index,
-						   u64 *avg_bw, u64 *peak_bw,
-						   u32 *tag)
-{
-	struct kona_icc_client_vote *client;
-	u64 avg = 0;
-	u64 peak = 0;
-	u32 aggregate_tag = 0;
-
-	if (avg_bw)
-		*avg_bw = 0;
-	if (peak_bw)
-		*peak_bw = 0;
-	if (tag)
-		*tag = KONA_SHADOW_TAG_ALWAYS;
-
-	if (!qp || index >= qp->num_nodes)
-		return;
-
-	list_for_each_entry(client, &qp->client_votes, node) {
-		if (!client->valid || client->index != index)
-			continue;
-
-		if (U64_MAX - avg < client->avg_bw)
-			avg = U64_MAX;
-		else
-			avg += client->avg_bw;
-
-		peak = max(peak, client->peak_bw);
-		aggregate_tag |= kona_icc_client_effective_tag(client->tag);
-	}
-
-	if (!aggregate_tag)
-		aggregate_tag = KONA_SHADOW_TAG_ALWAYS;
-
-	if (avg_bw)
-		*avg_bw = avg;
-	if (peak_bw)
-		*peak_bw = peak;
-	if (tag)
-		*tag = aggregate_tag;
-}
-
 static struct icc_path *kona_icc_xlate(struct icc_provider *provider,
 				       const struct of_phandle_args *spec)
 {
 	struct kona_icc_provider *qp = dev_get_drvdata(provider->dev);
 	const struct kona_icc_node_desc *desc;
-	struct kona_icc_client_vote *client;
 	struct icc_path *path;
 	unsigned int index = 0;
 
@@ -4187,21 +4124,7 @@ static struct icc_path *kona_icc_xlate(struct icc_provider *provider,
 	if (IS_ERR(path))
 		return path;
 
-	client = kzalloc(sizeof(*client), GFP_KERNEL);
-	if (!client) {
-		kona_icc_release(path);
-		return ERR_PTR(-ENOMEM);
-	}
-
-	client->qp = qp;
-	client->index = index;
-	INIT_LIST_HEAD(&client->node);
-
-	mutex_lock(&qp->vote_lock);
-	list_add_tail(&client->node, &qp->client_votes);
-	mutex_unlock(&qp->vote_lock);
-
-	path->data = client;
+	path->data = (void *)(uintptr_t)index;
 
 	return path;
 }
@@ -8169,16 +8092,12 @@ static void kona_icc_validate_vote(struct kona_icc_provider *qp,
 static int __kona_icc_set(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 {
 	struct kona_icc_provider *qp;
-	struct kona_icc_client_vote *client;
 	const struct kona_icc_node_desc *desc;
 	u64 prev_req_ab = U64_MAX, prev_req_ib = U64_MAX;
 	u64 prev_eff_ab = U64_MAX, prev_eff_ib = U64_MAX;
-	u64 raw_ab;
-	u64 raw_ib;
-	u64 ab;
-	u64 ib;
+	u64 ab = (u64)avg_bw;
+	u64 ib = (u64)peak_bw;
 	unsigned int index;
-	u32 aggregate_tag;
 
 	if (IS_ERR_OR_NULL(path) || !path->provider)
 		return -EINVAL;
@@ -8187,27 +8106,9 @@ static int __kona_icc_set(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 	if (!qp)
 		return -EINVAL;
 
-	client = path->data;
-	if (!client || client->qp != qp)
-		return -EINVAL;
-
-	client->avg_bw = (u64)avg_bw;
-	client->peak_bw = (u64)peak_bw;
-	client->tag = path->tag;
-	client->valid = true;
-
-	index = client->index;
+	index = (unsigned int)(uintptr_t)path->data;
 	if (index >= qp->num_nodes)
 		return -EINVAL;
-
-	kona_icc_aggregate_node_clients(qp, index, &raw_ab, &raw_ib,
-						&aggregate_tag);
-	if (raw_ab > KONA_ICC_MAX_LOGICAL_VOTE)
-		raw_ab = KONA_ICC_MAX_LOGICAL_VOTE;
-	if (raw_ib > KONA_ICC_MAX_LOGICAL_VOTE)
-		raw_ib = KONA_ICC_MAX_LOGICAL_VOTE;
-	ab = raw_ab;
-	ib = raw_ib;
 
 	desc = &qp->nodes[index];
 	if (kona_icc_is_cpu_memory_path(desc))
@@ -8222,7 +8123,7 @@ static int __kona_icc_set(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 	 */
 	if (kona_vote_debug && kona_icc_is_cpu_memory_path(desc))
 		dev_info(qp->provider.dev,
-			 "kona-vote: id=%u raw=%u/%u aggregate=%llu/%llu base=%llu/%llu\n",
+			 "kona-vote: id=%u raw=%u/%u initial=%llu/%llu base=%llu/%llu\n",
 			 desc->id, avg_bw, peak_bw, (unsigned long long)ab,
 			 (unsigned long long)ib, (unsigned long long)ab,
 			 (unsigned long long)ib);
@@ -8243,7 +8144,7 @@ static int __kona_icc_set(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 	KONA_VOTE_TRACE(qp, desc, "before-floor", ab, ib);
 	if ((ab || ib) && kona_perf_floor_enable && kona_icc_stage >= 4 &&
 	    !kona_icc_is_policy_suppressed_path(desc)) {
-		kona_icc_apply_floor(qp, desc, ab, ib, &ab, &ib);
+		kona_icc_apply_floor(qp, desc, avg_bw, peak_bw, &ab, &ib);
 	}
 	KONA_VOTE_TRACE(qp, desc, "after-floor", ab, ib);
 	KONA_VOTE_TRACE(qp, desc, "before-hysteresis", ab, ib);
@@ -8286,8 +8187,7 @@ skip_perf_floor:
 	
 	/* Validate the final transformed value before cache, replay, or submission. */
 	KONA_VOTE_TRACE(qp, desc, "before-validator", ab, ib);
-	kona_icc_validate_vote(qp, desc, raw_ab, raw_ib,
-			       &ab, &ib);
+	kona_icc_validate_vote(qp, desc, (u64)avg_bw, (u64)peak_bw, &ab, &ib);
 	KONA_VOTE_TRACE(qp, desc, "after-validator", ab, ib);
 	KONA_VOTE_TRACE(qp, desc, "before-cache", ab, ib);
 	if (kona_vote_debug && kona_icc_is_cpu_memory_path(desc))
@@ -8311,15 +8211,15 @@ skip_perf_floor:
 	if (qp->eff_ib)
 		prev_eff_ib = qp->eff_ib[index];
 	if (qp->req_ab)
-		qp->req_ab[index] = raw_ab;
+		qp->req_ab[index] = (u64)avg_bw;
 	if (qp->req_ib)
-		qp->req_ib[index] = raw_ib;
+		qp->req_ib[index] = (u64)peak_bw;
 	if (qp->eff_ab)
 		qp->eff_ab[index] = ab;
 	if (qp->eff_ib)
 		qp->eff_ib[index] = ib;
 	if (qp->shadow_tags)
-		WRITE_ONCE(qp->shadow_tags[index], aggregate_tag);
+		WRITE_ONCE(qp->shadow_tags[index], path->tag);
 	if (WARN_ON_ONCE(!qp->eff_ab || !qp->eff_ib ||
 			 qp->eff_ab[index] != ab || qp->eff_ib[index] != ib))
 		return -EIO;
@@ -8341,10 +8241,10 @@ skip_perf_floor:
 			(unsigned long long)ab, (unsigned long long)ib,
 			kona_cpu_model_stage());
 	}
-	if (prev_req_ab != raw_ab || prev_req_ib != raw_ib ||
+	if (prev_req_ab != avg_bw || prev_req_ib != peak_bw ||
 	    prev_eff_ab != ab || prev_eff_ib != ib)
 		kona_icc_mark_dirty(qp, index);
-	if (qp->last_active_jiffies && (raw_ab || raw_ib))
+	if (qp->last_active_jiffies && (avg_bw || peak_bw))
 		qp->last_active_jiffies[index] = jiffies;
 
 	/*
@@ -9588,23 +9488,6 @@ err_unregister:
 
 static void kona_icc_release(struct icc_path *path)
 {
-	struct kona_icc_client_vote *client;
-
-	if (!path)
-		return;
-
-	client = path->data;
-	if (client) {
-		struct kona_icc_provider *qp = client->qp;
-
-		if (qp) {
-			mutex_lock(&qp->vote_lock);
-			list_del_init(&client->node);
-			mutex_unlock(&qp->vote_lock);
-		}
-		kfree(client);
-	}
-
 	kfree(path);
 }
 
@@ -9959,7 +9842,6 @@ static int kona_icc_probe(struct platform_device *pdev)
 
 	spin_lock_init(&qp->dirty_lock);
 	mutex_init(&qp->vote_lock);
-	INIT_LIST_HEAD(&qp->client_votes);
 
 
 	INIT_DELAYED_WORK(&qp->retry_work, kona_icc_retry_workfn);
@@ -10188,7 +10070,6 @@ err_free_bitmaps:
 static int kona_icc_remove(struct platform_device *pdev)
 {
 	struct kona_icc_provider *qp = platform_get_drvdata(pdev);
-	struct kona_icc_client_vote *client, *tmp;
 
 	if (READ_ONCE(kona_ipa_provider) == qp)
 		WRITE_ONCE(kona_ipa_provider, NULL);
@@ -10201,13 +10082,6 @@ static int kona_icc_remove(struct platform_device *pdev)
 	cancel_delayed_work_sync(&qp->resume_floor_work);
 	cancel_delayed_work_sync(&qp->cpu_downvote_work);
 	cancel_delayed_work_sync(&qp->retry_work);
-
-	mutex_lock(&qp->vote_lock);
-	list_for_each_entry_safe(client, tmp, &qp->client_votes, node) {
-		list_del_init(&client->node);
-		client->qp = NULL;
-	}
-	mutex_unlock(&qp->vote_lock);
 
 	if (qp->display_nb_registered) {
 		msm_drm_unregister_client(&qp->display_nb);
