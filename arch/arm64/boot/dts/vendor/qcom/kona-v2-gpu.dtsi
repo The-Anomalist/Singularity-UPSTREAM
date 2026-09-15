@@ -105,6 +105,7 @@
 	qcom,gpu-cfg-icc-bw-avg-kbps = <1 25>;
 	qcom,gpu-cfg-icc-bw-peak-kbps = <1 100>;
 
+	qcom,enable-ca-jump;
 	qcom,ca-busy-penalty = <9000>;
 	qcom,enable-midframe-timer;
 	qcom,wakeup-boost-ms = <60>;
@@ -153,6 +154,7 @@
 			#size-cells = <0>;
 			qcom,speed-bin = <0>;
 			qcom,initial-pwrlevel = <4>;
+			qcom,ca-target-pwrlevel = <4>;
 
 					qcom,gpu-pwrlevel@0 {
 								reg = <0>;
@@ -348,6 +350,7 @@
 			#size-cells = <0>;
 			qcom,speed-bin = <1>;
 			qcom,initial-pwrlevel = <4>;
+			qcom,ca-target-pwrlevel = <4>;
 
 					qcom,gpu-pwrlevel@0 {
 								reg = <0>;
@@ -543,6 +546,7 @@
 			#size-cells = <0>;
 			qcom,speed-bin = <3>;
 			qcom,initial-pwrlevel = <4>;
+			qcom,ca-target-pwrlevel = <4>;
 
 							qcom,gpu-pwrlevel@0 {
 								reg = <0>;
@@ -738,6 +742,7 @@
 			#size-cells = <0>;
 			qcom,speed-bin = <2>;
 			qcom,initial-pwrlevel = <4>;
+			qcom,ca-target-pwrlevel = <4>;
 
 					qcom,gpu-pwrlevel@0 {
 								reg = <0>;
@@ -933,6 +938,7 @@
 			#size-cells = <0>;
 			qcom,speed-bin = <4>;
 			qcom,initial-pwrlevel = <4>;
+			qcom,ca-target-pwrlevel = <4>;
 
 					qcom,gpu-pwrlevel@0 {
 								reg = <0>;
