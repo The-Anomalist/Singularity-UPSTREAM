@@ -119,8 +119,19 @@ static void _track_context(struct adreno_device *adreno_dev,
 		struct adreno_context *drawctxt)
 {
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
+	unsigned long now = jiffies;
+	bool same_head;
 
 	spin_lock(&adreno_dev->active_list_lock);
+
+	same_head = list_is_first(&drawctxt->active_node,
+			&adreno_dev->active_list);
+	if (same_head && time_before(now,
+			drawctxt->active_time + msecs_to_jiffies(100))) {
+		drawctxt->active_time = now;
+		spin_unlock(&adreno_dev->active_list_lock);
+		return;
+	}
 
 	_add_context(adreno_dev, drawctxt);
 	_adreno_count_active_contexts(adreno_dev, drawqueue,
