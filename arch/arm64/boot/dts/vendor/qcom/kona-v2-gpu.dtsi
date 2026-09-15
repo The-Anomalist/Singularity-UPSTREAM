@@ -8,8 +8,8 @@
 	gpu_opp_table_v2: gpu-opp-table_v2 {
 		compatible = "operating-points-v2";
 
-		opp-935000000 {
-			opp-hz = /bits/ 64 <935000000>;
+		opp-944000000 {
+			opp-hz = /bits/ 64 <944000000>;
 			opp-microvolt = <RPMH_REGULATOR_LEVEL_TURBO_L1>;
 		};
 
@@ -153,11 +153,10 @@
 			#size-cells = <0>;
 			qcom,speed-bin = <0>;
 			qcom,initial-pwrlevel = <4>;
-			qcom,max-pwrlevel = <1>;
 
 					qcom,gpu-pwrlevel@0 {
 								reg = <0>;
-								qcom,gpu-freq = <935000000>;
+								qcom,gpu-freq = <944000000>;
 								qcom,bus-freq-ddr7 = <13>;
 								qcom,bus-min-ddr7 = <13>;
 								qcom,bus-max-ddr7 = <13>;
@@ -349,11 +348,10 @@
 			#size-cells = <0>;
 			qcom,speed-bin = <1>;
 			qcom,initial-pwrlevel = <4>;
-			qcom,max-pwrlevel = <1>;
 
 					qcom,gpu-pwrlevel@0 {
 								reg = <0>;
-								qcom,gpu-freq = <935000000>;
+								qcom,gpu-freq = <944000000>;
 								qcom,bus-freq-ddr7 = <13>;
 								qcom,bus-min-ddr7 = <13>;
 								qcom,bus-max-ddr7 = <13>;
@@ -545,11 +543,10 @@
 			#size-cells = <0>;
 			qcom,speed-bin = <3>;
 			qcom,initial-pwrlevel = <4>;
-			qcom,max-pwrlevel = <1>;
 
 							qcom,gpu-pwrlevel@0 {
 								reg = <0>;
-								qcom,gpu-freq = <935000000>;
+								qcom,gpu-freq = <944000000>;
 								qcom,bus-freq-ddr7 = <13>;
 								qcom,bus-min-ddr7 = <13>;
 								qcom,bus-max-ddr7 = <13>;
@@ -741,11 +738,10 @@
 			#size-cells = <0>;
 			qcom,speed-bin = <2>;
 			qcom,initial-pwrlevel = <4>;
-			qcom,max-pwrlevel = <1>;
 
 					qcom,gpu-pwrlevel@0 {
 								reg = <0>;
-								qcom,gpu-freq = <935000000>;
+								qcom,gpu-freq = <944000000>;
 								qcom,bus-freq-ddr7 = <13>;
 								qcom,bus-min-ddr7 = <13>;
 								qcom,bus-max-ddr7 = <13>;
@@ -937,11 +933,10 @@
 			#size-cells = <0>;
 			qcom,speed-bin = <4>;
 			qcom,initial-pwrlevel = <4>;
-			qcom,max-pwrlevel = <1>;
 
 					qcom,gpu-pwrlevel@0 {
 								reg = <0>;
-								qcom,gpu-freq = <935000000>;
+								qcom,gpu-freq = <944000000>;
 								qcom,bus-freq-ddr7 = <13>;
 								qcom,bus-min-ddr7 = <13>;
 								qcom,bus-max-ddr7 = <13>;

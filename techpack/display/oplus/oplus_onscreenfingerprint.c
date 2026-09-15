@@ -1176,9 +1176,7 @@ int oplus_display_panel_notify_fp_press(void *data)
 		}
 
 		set_mode = oplus_display_mode ? vid_mode : cmd_mode;
-		if (onscreenfp_status)
-			set_mode = (drm_mode_vrefresh(cur_mode) == 90) ?
-				cur_mode : vid_mode;
+		set_mode = onscreenfp_status ? vid_mode : set_mode;
 		if (!crtc_state->active || !crtc_state->enable)
 			goto error;
 

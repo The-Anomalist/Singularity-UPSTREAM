@@ -38,8 +38,8 @@
 	gpu_opp_table: gpu-opp-table {
 		compatible = "operating-points-v2";
 
-		opp-935000000 {
-			opp-hz = /bits/ 64 <935000000>;
+		opp-944000000 {
+			opp-hz = /bits/ 64 <944000000>;
 			opp-microvolt = <RPMH_REGULATOR_LEVEL_TURBO_L1>;
 		};
 
@@ -130,7 +130,6 @@
 		qcom,chipid = <0x06050000>;
 
 		qcom,initial-pwrlevel = <4>;
-		qcom,max-pwrlevel = <1>;
 
 		qcom,idle-timeout = <120>; /* msecs */
 
@@ -323,7 +322,7 @@
 
 							qcom,gpu-pwrlevel@0 {
 								reg = <0>;
-								qcom,gpu-freq = <935000000>;
+								qcom,gpu-freq = <944000000>;
 								qcom,bus-freq-ddr7 = <13>;
 								qcom,bus-min-ddr7 = <13>;
 								qcom,bus-max-ddr7 = <13>;

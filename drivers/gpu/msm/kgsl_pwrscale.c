@@ -836,13 +836,7 @@ int kgsl_devfreq_target(struct device *dev, unsigned long *freq, u32 flags)
 		}
 
 		if (level != active_level)
-			kgsl_pwrctrl_pwrlevel_change(device, level);
-
-		dev_info_ratelimited(device->dev,
-			"GPU devfreq target req=%lu applied=%lu level=%u active=%u min=%u max=%u\n",
-			rec_freq, kgsl_pwrctrl_active_freq(pwr), level,
-			pwr->active_pwrlevel, pwr->min_pwrlevel,
-			pwr->max_pwrlevel);
+			kgsl_pwrctrl_pwrlevel_change_devfreq(device, level);
 	} else if (popp_stable(device)) {
 		popp_trans1(device);
 	}

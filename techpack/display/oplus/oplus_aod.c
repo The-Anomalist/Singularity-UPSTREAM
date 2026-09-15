@@ -452,9 +452,7 @@ int oplus_ramless_panel_set_video(void *buf)
 		}
 
 		set_mode = oplus_display_mode ? vid_mode : cmd_mode;
-		if (oplus_onscreenfp_status)
-			set_mode = (drm_mode_vrefresh(cur_mode) == 90) ?
-				cur_mode : vid_mode;
+		set_mode = oplus_onscreenfp_status ? vid_mode : set_mode;
 
 		if (set_mode && drm_mode_vrefresh(set_mode) !=
 					drm_mode_vrefresh(&crtc_state->mode)) {

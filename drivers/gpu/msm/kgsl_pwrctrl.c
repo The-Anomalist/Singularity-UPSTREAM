@@ -275,13 +275,17 @@ static void _ab_buslevel_update(struct kgsl_pwrctrl *pwr,
  */
 static unsigned int _adjust_pwrlevel(struct kgsl_pwrctrl *pwr, int level,
 					struct kgsl_pwr_constraint *pwrc,
-					int popp)
+					int popp, bool user_limits)
 {
-	unsigned int max_pwrlevel = max_t(unsigned int, pwr->thermal_pwrlevel,
+	unsigned int max_pwrlevel = pwr->thermal_pwrlevel;
+	unsigned int min_pwrlevel = pwr->thermal_pwrlevel_floor;
+
+	if (user_limits) {
+		max_pwrlevel = max_t(unsigned int, max_pwrlevel,
 					pwr->max_pwrlevel);
-	unsigned int min_pwrlevel = min_t(unsigned int,
-					pwr->thermal_pwrlevel_floor,
+		min_pwrlevel = min_t(unsigned int, min_pwrlevel,
 					pwr->min_pwrlevel);
+	}
 
 	/* Ensure that max/min pwrlevels are within thermal max/min limits */
 	max_pwrlevel = min_t(unsigned int, max_pwrlevel,
@@ -938,7 +942,16 @@ unsigned int kgsl_pwrctrl_adjust_pwrlevel(struct kgsl_device *device,
 	 * constraints, etc
 	 */
 	return _adjust_pwrlevel(pwr, new_level, &pwr->constraint,
-					device->pwrscale.popp_level);
+					device->pwrscale.popp_level, true);
+}
+
+static unsigned int kgsl_pwrctrl_adjust_devfreq_pwrlevel(
+		struct kgsl_device *device, unsigned int new_level)
+{
+	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
+
+	return _adjust_pwrlevel(pwr, new_level, &pwr->constraint,
+					device->pwrscale.popp_level, false);
 }
 
 /**
@@ -952,14 +965,16 @@ unsigned int kgsl_pwrctrl_adjust_pwrlevel(struct kgsl_device *device,
  * default value.  Do not change the bus if a constraint keeps the new
  * level at the current level.  Set the new GPU frequency.
  */
-void kgsl_pwrctrl_pwrlevel_change(struct kgsl_device *device,
-				unsigned int new_level)
+static void _kgsl_pwrctrl_pwrlevel_change(struct kgsl_device *device,
+				unsigned int new_level, bool devfreq_request)
 {
 	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
 	struct kgsl_pwrlevel *pwrlevel;
 	unsigned int old_level = pwr->active_pwrlevel;
 
-	new_level = kgsl_pwrctrl_adjust_pwrlevel(device, new_level);
+	new_level = devfreq_request ?
+		kgsl_pwrctrl_adjust_devfreq_pwrlevel(device, new_level) :
+		kgsl_pwrctrl_adjust_pwrlevel(device, new_level);
 
 	/*
 	 * If thermal cycling is required and the new level hits the
@@ -1064,7 +1079,19 @@ void kgsl_pwrctrl_pwrlevel_change(struct kgsl_device *device,
 			pwr->pwrlevels[new_level].gpu_freq);
 }
 
+void kgsl_pwrctrl_pwrlevel_change(struct kgsl_device *device,
+				unsigned int new_level)
+{
+	_kgsl_pwrctrl_pwrlevel_change(device, new_level, false);
+}
 EXPORT_SYMBOL(kgsl_pwrctrl_pwrlevel_change);
+
+void kgsl_pwrctrl_pwrlevel_change_devfreq(struct kgsl_device *device,
+				unsigned int new_level)
+{
+	_kgsl_pwrctrl_pwrlevel_change(device, new_level, true);
+}
+EXPORT_SYMBOL(kgsl_pwrctrl_pwrlevel_change_devfreq);
 
 /**
  * kgsl_pwrctrl_set_constraint() - Validate and change enforced constraint
@@ -1086,7 +1113,7 @@ void kgsl_pwrctrl_set_constraint(struct kgsl_device *device,
 	if (device == NULL || pwrc == NULL)
 		return;
 	constraint = _adjust_pwrlevel(&device->pwrctrl,
-				device->pwrctrl.active_pwrlevel, pwrc, 0);
+				device->pwrctrl.active_pwrlevel, pwrc, 0, true);
 	pwrc_old = &device->pwrctrl.constraint;
 
 	/*
@@ -2211,6 +2238,33 @@ static void kgsl_pwrctrl_axi(struct kgsl_device *device, int state)
 	}
 }
 
+static unsigned int kgsl_pwrctrl_devfreq_wake_level(struct kgsl_device *device)
+{
+	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
+	struct devfreq *df = device->pwrscale.devfreqptr;
+	unsigned long min_freq, max_freq, default_freq;
+	unsigned int i;
+
+	if (!df)
+		return pwr->default_pwrlevel;
+
+	min_freq = max(df->scaling_min_freq, df->min_freq);
+	max_freq = min(df->scaling_max_freq, df->max_freq);
+	default_freq = pwr->pwrlevels[pwr->default_pwrlevel].gpu_freq;
+
+	if (default_freq >= min_freq && default_freq <= max_freq)
+		return pwr->default_pwrlevel;
+
+	for (i = 0; i < pwr->num_pwrlevels - 1; i++) {
+		unsigned long freq = pwr->pwrlevels[i].gpu_freq;
+
+		if (freq >= min_freq && freq <= max_freq)
+			return i;
+	}
+
+	return pwr->default_pwrlevel;
+}
+
 static int _regulator_enable(struct kgsl_device *device,
 		struct kgsl_regulator *regulator)
 {
@@ -2656,11 +2710,6 @@ int kgsl_pwrctrl_init(struct kgsl_device *device)
 
 	pwr->max_pwrlevel = 0;
 	pwr->min_pwrlevel = pwr->num_pwrlevels - 2;
-	if (of_property_read_u32(pdev->dev.of_node, "qcom,max-pwrlevel",
-			&pwr->max_pwrlevel))
-		pwr->max_pwrlevel = 0;
-	pwr->max_pwrlevel = min_t(unsigned int, pwr->max_pwrlevel,
-			pwr->num_pwrlevels - 2);
 	pwr->thermal_pwrlevel = 0;
 	pwr->thermal_pwrlevel_floor = pwr->min_pwrlevel;
 
@@ -3051,7 +3100,7 @@ static int kgsl_pwrctrl_enable(struct kgsl_device *device)
 		 */
 		level = pwr->active_pwrlevel;
 	} else {
-		level = pwr->default_pwrlevel;
+		level = kgsl_pwrctrl_devfreq_wake_level(device);
 	}
 
 	kgsl_pwrctrl_pwrlevel_change(device, level);

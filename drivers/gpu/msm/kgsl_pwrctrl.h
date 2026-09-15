@@ -284,6 +284,8 @@ void kgsl_idle_check(struct work_struct *work);
 void kgsl_pre_hwaccess(struct kgsl_device *device);
 void kgsl_pwrctrl_pwrlevel_change(struct kgsl_device *device,
 	unsigned int level);
+void kgsl_pwrctrl_pwrlevel_change_devfreq(struct kgsl_device *device,
+	unsigned int level);
 void kgsl_pwrctrl_buslevel_update(struct kgsl_device *device,
 	bool on);
 int kgsl_pwrctrl_init_sysfs(struct kgsl_device *device);
