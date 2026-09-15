@@ -51,7 +51,7 @@
  * ACTIVE is the default CPU fabric owner. WAKE/SLEEP remains opt-in
  * until a non-zero suspend transaction has been validated.
  */
-static bool kona_modern_hw_active_enable = false;
+static bool kona_modern_hw_active_enable = true;
 module_param_named(modern_hw_active_enable,
 		   kona_modern_hw_active_enable, bool, 0644);
 MODULE_PARM_DESC(modern_hw_active_enable,
