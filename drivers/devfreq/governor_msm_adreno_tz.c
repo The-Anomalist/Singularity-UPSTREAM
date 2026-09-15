@@ -80,6 +80,43 @@ static inline u32 tz_busy_ceiling(struct devfreq_msm_adreno_tz_data *priv)
 	return priv->tz_busy_ceiling ?: CEILING;
 }
 
+static inline u32 tz_submit_boost_ms(struct devfreq_msm_adreno_tz_data *priv)
+{
+	return priv->submit_boost_ms ?: 8;
+}
+
+static inline u32 tz_submit_boost_step(struct devfreq_msm_adreno_tz_data *priv)
+{
+	return priv->submit_boost_step ?: 1;
+}
+
+static void tz_mark_submit_boost(struct devfreq_msm_adreno_tz_data *priv)
+{
+	u64 now = ktime_get_ns();
+	u64 interval = (u64)tz_submit_boost_ms(priv) * NSEC_PER_MSEC;
+
+	if (now - priv->last_submit_boost_ns < interval)
+		return;
+
+	priv->last_submit_boost_ns = now;
+	priv->submit_boost_pending = true;
+}
+
+static int tz_apply_submit_boost(struct devfreq_msm_adreno_tz_data *priv,
+		int level)
+{
+	u32 step = tz_submit_boost_step(priv);
+
+	if (!priv->submit_boost_pending)
+		return level;
+
+	priv->submit_boost_pending = false;
+	if (level <= 0 || step >= (u32)level)
+		return 0;
+
+	return level - step;
+}
+
 /*
  * Returns GPU suspend time in millisecond.
  */
@@ -403,6 +440,13 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq)
 
 	/* Update the GPU load statistics */
 	compute_work_load(stats, priv, devfreq);
+
+	level = devfreq_get_freq_level(devfreq, stats->current_frequency);
+	if (level < 0) {
+		pr_err(TAG "bad freq %ld\n", stats->current_frequency);
+		return level;
+	}
+
 	/*
 	 * Do not waste CPU cycles running this algorithm if
 	 * the GPU just started, or if less than FLOOR time
@@ -412,13 +456,9 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq)
 	if ((stats->total_time == 0) ||
 		(priv->bin.total_time < tz_sample_floor(priv)) ||
 		(unsigned int) priv->bin.busy_time < tz_min_busy(priv)) {
+		level = tz_apply_submit_boost(priv, level);
+		*freq = devfreq->profile->freq_table[level];
 		return 0;
-	}
-
-	level = devfreq_get_freq_level(devfreq, stats->current_frequency);
-	if (level < 0) {
-		pr_err(TAG "bad freq %ld\n", stats->current_frequency);
-		return level;
 	}
 
 	/*
@@ -462,6 +502,7 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq)
 		level = max(level, 0);
 		level = min_t(int, level, devfreq->profile->max_state - 1);
 	}
+	level = tz_apply_submit_boost(priv, level);
 
 	*freq = devfreq->profile->freq_table[level];
 	return 0;
@@ -485,8 +526,18 @@ static int tz_notify(struct notifier_block *nb, unsigned long type, void *devp)
 			mutex_unlock(&partner_gpu_profile->bus_devfreq->lock);
 		}
 		break;
-	/* ignored by this governor */
 	case ADRENO_DEVFREQ_NOTIFY_SUBMIT:
+		if (devfreq->data)
+			tz_mark_submit_boost(devfreq->data);
+		mutex_lock(&devfreq->lock);
+		result = update_devfreq(devfreq);
+		mutex_unlock(&devfreq->lock);
+		if (partner_gpu_profile && partner_gpu_profile->bus_devfreq) {
+			mutex_lock(&partner_gpu_profile->bus_devfreq->lock);
+			update_devfreq(partner_gpu_profile->bus_devfreq);
+			mutex_unlock(&partner_gpu_profile->bus_devfreq->lock);
+		}
+		break;
 	default:
 		break;
 	}

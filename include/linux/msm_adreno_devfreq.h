@@ -66,6 +66,10 @@ bool tz_available;
 u32 tz_sample_floor;
 u32 tz_min_busy;
 u32 tz_busy_ceiling;
+bool submit_boost_pending;
+u64 last_submit_boost_ns;
+u32 submit_boost_ms;
+u32 submit_boost_step;
 };
 
 struct msm_adreno_extended_profile {

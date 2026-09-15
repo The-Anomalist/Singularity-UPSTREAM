@@ -1266,6 +1266,10 @@ int kgsl_pwrscale_init(struct device *dev, const char *governor)
 		"qcom,tz-min-busy", &data->tz_min_busy);
 	of_property_read_u32(device->pdev->dev.of_node,
 		"qcom,tz-busy-ceiling", &data->tz_busy_ceiling);
+	of_property_read_u32(device->pdev->dev.of_node,
+		"qcom,submit-boost-ms", &data->submit_boost_ms);
+	of_property_read_u32(device->pdev->dev.of_node,
+		"qcom,submit-boost-step", &data->submit_boost_step);
 
 	if (pwrscale->ctxt_aware_enable) {
 		data->ctxt_aware_enable = pwrscale->ctxt_aware_enable;
