@@ -6,9 +6,11 @@
 
 #include <asm/cacheflush.h>
 #include <linux/highmem.h>
+#include <linux/moduleparam.h>
 #include <linux/of.h>
 #include <linux/scatterlist.h>
 #include <linux/swap.h>
+#include <linux/workqueue.h>
 
 #include "kgsl_device.h"
 #include "kgsl_pool.h"
@@ -56,6 +58,17 @@ static int kgsl_pool_max_pages;
  * workloads to timeout before completion.
  */
 static bool kgsl_pool_sysmem_fallback = true;
+
+static bool kgsl_pool_background_refill = true;
+module_param_named(pool_background_refill, kgsl_pool_background_refill,
+		bool, 0644);
+MODULE_PARM_DESC(pool_background_refill,
+		"Refill KGSL page pools in the background after allocation bursts");
+
+#define KGSL_POOL_REFILL_BATCH 16
+
+static void kgsl_pool_refill_worker(struct work_struct *work);
+static DECLARE_WORK(kgsl_pool_refill_work, kgsl_pool_refill_worker);
 
 
 /* Returns KGSL pool corresponding to input page order*/
@@ -128,6 +141,26 @@ kgsl_pool_size(struct kgsl_page_pool *kgsl_pool)
 	spin_unlock(&kgsl_pool->list_lock);
 
 	return size;
+}
+
+static int kgsl_pool_page_count(struct kgsl_page_pool *kgsl_pool)
+{
+	int count;
+
+	spin_lock(&kgsl_pool->list_lock);
+	count = kgsl_pool->page_count;
+	spin_unlock(&kgsl_pool->list_lock);
+
+	return count;
+}
+
+static void kgsl_pool_schedule_refill(struct kgsl_page_pool *pool)
+{
+	if (!kgsl_pool_background_refill || !pool || !pool->reserved_pages)
+		return;
+
+	if (kgsl_pool_page_count(pool) * 2 <= pool->reserved_pages)
+		schedule_work(&kgsl_pool_refill_work);
 }
 
 /* Returns the number of pages in all kgsl page pools */
@@ -335,6 +368,8 @@ int kgsl_pool_alloc_page(int *page_size, struct page **pages,
 
 	pool_idx = kgsl_pool_idx_lookup(order);
 	page = _kgsl_pool_get_page(pool);
+	if (page)
+		kgsl_pool_schedule_refill(pool);
 
 	/* Allocate a new page if not allocated from pool */
 	if (page == NULL) {
@@ -459,6 +494,33 @@ static void kgsl_pool_reserve_pages(void)
 			page = alloc_pages(gfp_mask, order);
 			if (page != NULL)
 				_kgsl_pool_add_page(&kgsl_pools[i], page);
+		}
+	}
+}
+
+static void kgsl_pool_refill_worker(struct work_struct *work)
+{
+	int i;
+
+	for (i = 0; i < kgsl_num_pools; i++) {
+		struct kgsl_page_pool *pool = &kgsl_pools[i];
+		int target = min_t(unsigned int, pool->reserved_pages,
+				pool->max_pages);
+		int refill = target - kgsl_pool_page_count(pool);
+		int j;
+
+		if (refill <= 0)
+			continue;
+
+		refill = min_t(int, refill, KGSL_POOL_REFILL_BATCH);
+		for (j = 0; j < refill; j++) {
+			gfp_t gfp_mask = kgsl_gfp_mask(pool->pool_order);
+			struct page *page = alloc_pages(gfp_mask, pool->pool_order);
+
+			if (!page)
+				break;
+
+			_kgsl_pool_add_page(pool, page);
 		}
 	}
 }
@@ -601,6 +663,8 @@ void kgsl_init_page_pools(struct kgsl_device *device)
 
 void kgsl_exit_page_pools(void)
 {
+	cancel_work_sync(&kgsl_pool_refill_work);
+
 	/* Release all pages in pools, if any.*/
 	kgsl_pool_reduce(0, true);
 
