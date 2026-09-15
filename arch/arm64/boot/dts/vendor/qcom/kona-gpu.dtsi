@@ -129,8 +129,8 @@
 
 		qcom,chipid = <0x06050000>;
 
-		qcom,initial-pwrlevel = <0>;
-		qcom,max-pwrlevel = <0>;
+		qcom,initial-pwrlevel = <4>;
+		qcom,max-pwrlevel = <1>;
 
 		qcom,idle-timeout = <120>; /* msecs */
 
@@ -154,7 +154,7 @@
 		qcom,ca-busy-penalty = <9000>;
 		qcom,enable-midframe-timer;
 		qcom,wakeup-boost-ms = <50>;
-		qcom,wakeup-boost-pwrlevel = <0>;
+		qcom,wakeup-boost-pwrlevel = <4>;
 
 		interconnects = <&kona_icc KONA_ICC_GPU_TO_LLCC>,
 				<&kona_icc KONA_ICC_GPU_TO_MEM>,

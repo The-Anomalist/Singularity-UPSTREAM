@@ -108,7 +108,7 @@
 	qcom,ca-busy-penalty = <9000>;
 	qcom,enable-midframe-timer;
 	qcom,wakeup-boost-ms = <60>;
-	qcom,wakeup-boost-pwrlevel = <0>;
+	qcom,wakeup-boost-pwrlevel = <4>;
 	qcom,tz-sample-floor = <2500>;
 	qcom,tz-min-busy = <550>;
 	qcom,tz-busy-ceiling = <28000>;
@@ -152,8 +152,8 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 			qcom,speed-bin = <0>;
-			qcom,initial-pwrlevel = <0>;
-			qcom,max-pwrlevel = <0>;
+			qcom,initial-pwrlevel = <4>;
+			qcom,max-pwrlevel = <1>;
 
 					qcom,gpu-pwrlevel@0 {
 								reg = <0>;
@@ -348,8 +348,8 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 			qcom,speed-bin = <1>;
-			qcom,initial-pwrlevel = <0>;
-			qcom,max-pwrlevel = <0>;
+			qcom,initial-pwrlevel = <4>;
+			qcom,max-pwrlevel = <1>;
 
 					qcom,gpu-pwrlevel@0 {
 								reg = <0>;
@@ -544,8 +544,8 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 			qcom,speed-bin = <3>;
-			qcom,initial-pwrlevel = <0>;
-			qcom,max-pwrlevel = <0>;
+			qcom,initial-pwrlevel = <4>;
+			qcom,max-pwrlevel = <1>;
 
 							qcom,gpu-pwrlevel@0 {
 								reg = <0>;
@@ -740,8 +740,8 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 			qcom,speed-bin = <2>;
-			qcom,initial-pwrlevel = <0>;
-			qcom,max-pwrlevel = <0>;
+			qcom,initial-pwrlevel = <4>;
+			qcom,max-pwrlevel = <1>;
 
 					qcom,gpu-pwrlevel@0 {
 								reg = <0>;
@@ -936,8 +936,8 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 			qcom,speed-bin = <4>;
-			qcom,initial-pwrlevel = <0>;
-			qcom,max-pwrlevel = <0>;
+			qcom,initial-pwrlevel = <4>;
+			qcom,max-pwrlevel = <1>;
 
 					qcom,gpu-pwrlevel@0 {
 								reg = <0>;
