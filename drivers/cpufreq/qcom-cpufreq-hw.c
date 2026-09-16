@@ -448,14 +448,17 @@ qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 	u64 now;
 	bool rate_limited = false;
 	bool update_scale = false;
+	bool reuse_curr_freq = false;
 
 	curr_index = readl_relaxed(c->reg_bases[REG_PERF_STATE]);
 	curr_index = min(curr_index, c->lut_max_entries - 1);
 	curr_freq = qcom_cpufreq_hw_resolve_rate(policy, curr_index);
 	programmed_index = qcom_cpufreq_hw_programmed_index(c, policy, index);
 
-	if (programmed_index == curr_index)
+	if (programmed_index == curr_index) {
+		reuse_curr_freq = true;
 		goto update_scale;
+	}
 
 	if (qcom_cpufreq_hw_within_hysteresis(c, curr_freq,
 					      policy->freq_table[index].frequency)) {
@@ -525,9 +528,13 @@ qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 	spin_unlock_irqrestore(&c->transition_lock, flags);
 
 update_scale:
-	actual_freq = qcom_cpufreq_hw_get(policy->cpu);
-	if (!actual_freq)
+	if (reuse_curr_freq) {
 		actual_freq = curr_freq;
+	} else {
+		actual_freq = qcom_cpufreq_hw_get(policy->cpu);
+		if (!actual_freq)
+			actual_freq = curr_freq;
+	}
 
 	spin_lock_irqsave(&c->transition_lock, flags);
 	if (c->last_scale_freq != actual_freq) {
