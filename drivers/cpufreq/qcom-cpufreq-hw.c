@@ -420,6 +420,23 @@ static bool qcom_cpufreq_hw_rate_limited(struct cpufreq_qcom *c,
 	return delta_ns < ((u64)limit_us * NSEC_PER_USEC);
 }
 
+static unsigned int qcom_cpufreq_hw_programmed_index(struct cpufreq_qcom *c,
+						     struct cpufreq_policy *policy,
+						     unsigned int index)
+{
+	unsigned int programmed_index;
+	unsigned long flags;
+
+	if (c->skip_data.skip && index == c->skip_data.high_temp_index) {
+		spin_lock_irqsave(&c->skip_data.lock, flags);
+		programmed_index = c->skip_data.final_index;
+		spin_unlock_irqrestore(&c->skip_data.lock, flags);
+		return programmed_index;
+	}
+
+	return policy->freq_table[index].driver_data;
+}
+
 static int
 qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 			     unsigned int index)
@@ -433,8 +450,9 @@ qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 	curr_index = readl_relaxed(c->reg_bases[REG_PERF_STATE]);
 	curr_index = min(curr_index, c->lut_max_entries - 1);
 	curr_freq = qcom_cpufreq_hw_resolve_rate(policy, curr_index);
+	programmed_index = qcom_cpufreq_hw_programmed_index(c, policy, index);
 
-	if (index == curr_index)
+	if (programmed_index == curr_index)
 		goto update_scale;
 
 	if (qcom_cpufreq_hw_within_hysteresis(c, curr_freq,
@@ -447,9 +465,10 @@ qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 
 	now = ktime_get_ns();
 	spin_lock_irqsave(&c->transition_lock, flags);
-	rate_limited = qcom_cpufreq_hw_rate_limited(c, curr_index, index, now);
+	rate_limited = qcom_cpufreq_hw_rate_limited(c, curr_index,
+						      programmed_index, now);
 	if (rate_limited) {
-		if (index > curr_index)
+		if (programmed_index > curr_index)
 			c->blocked_up_transitions++;
 		else
 			c->blocked_down_transitions++;
@@ -460,12 +479,10 @@ qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 
 	if (c->skip_data.skip && index == c->skip_data.high_temp_index) {
 		spin_lock_irqsave(&c->skip_data.lock, flags);
-		writel_relaxed(c->skip_data.final_index,
-				c->reg_bases[REG_PERF_STATE]);
-		spin_unlock_irqrestore(&c->skip_data.lock, flags);
 		programmed_index = c->skip_data.final_index;
+		writel_relaxed(programmed_index, c->reg_bases[REG_PERF_STATE]);
+		spin_unlock_irqrestore(&c->skip_data.lock, flags);
 	} else {
-		programmed_index = policy->freq_table[index].driver_data;
 		/*
 		 * Some Kona EPSS revisions sanitize an inactive LUT row, but accept
 		 * the multiplier when it is written immediately before selecting the
