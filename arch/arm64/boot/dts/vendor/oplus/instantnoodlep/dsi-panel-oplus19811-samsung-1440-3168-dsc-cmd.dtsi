@@ -1582,6 +1582,49 @@
 				qcom,mdss-dsc-bit-per-pixel = <8>;
 				qcom,mdss-dsc-block-prediction-enable;
 			};
+			timing@4 {
+				qcom,mdss-mdp-transfer-time-us = <9000>;
+				qcom,mdss-dsi-panel-framerate = <90>;
+				qcom,mdss-dsi-panel-clockrate = <1452000000>;
+				qcom,mdss-dsi-panel-width = <1440>;
+				qcom,mdss-dsi-panel-height = <3168>;
+				qcom,mdss-dsi-h-front-porch = <88>;
+				qcom,mdss-dsi-h-back-porch = <56>;
+				qcom,mdss-dsi-h-pulse-width = <8>;
+				qcom,mdss-dsi-h-sync-skew = <0>;
+				qcom,mdss-dsi-h-sync-pulse = <0>;
+				qcom,mdss-dsi-v-back-porch = <8>;
+				qcom,mdss-dsi-v-front-porch = <8>;
+				qcom,mdss-dsi-v-pulse-width = <8>;
+				qcom,mdss-dsi-h-left-border = <0>;
+				qcom,mdss-dsi-h-right-border = <0>;
+				qcom,mdss-dsi-v-top-border = <0>;
+				qcom,mdss-dsi-v-bottom-border = <0>;
+				qcom,mdss-dsi-panel-jitter = <0x4 0x1>;
+
+				qcom,mdss-dsi-timing-switch-command = [
+					/* 90HZ QHD+ */
+					39 01 00 00 00 00 03 F0 5A 5A
+					07 01 00 00 00 00 01 01
+					15 01 00 00 00 00 02 60 10
+					15 01 00 00 00 00 02 BA 03
+					15 01 00 00 00 00 02 F7 0F
+					39 01 00 00 00 00 05 2A 00 00 05 9F /* CASET */
+					39 01 00 00 00 00 05 2B 00 00 0C 5F /* PASET */
+					39 01 00 00 07 00 03 F0 A5 A5
+				];
+
+				qcom,mdss-dsi-timing-switch-command-state = "dsi_hs_mode";
+				qcom,lm-split = <720 720>;
+				qcom,compression-mode = "dsc";
+				qcom,mdss-dsc-encoders = <2>;
+				qcom,mdss-dsc-slice-height = <96>;
+				qcom,mdss-dsc-slice-width = <720>;
+				qcom,mdss-dsc-slice-per-pkt = <2>;
+				qcom,mdss-dsc-bit-per-component = <10>;
+				qcom,mdss-dsc-bit-per-pixel = <8>;
+				qcom,mdss-dsc-block-prediction-enable;
+			};
 			timing@3 {
 				qcom,mdss-mdp-transfer-time-us = <12000>;
 				qcom,mdss-dsi-timing-default;
@@ -2168,6 +2211,13 @@
 		timing@3 { /* WQHD+ 60hz 412.8Mhz 825.6Mbps */
 			qcom,mdss-dsi-panel-phy-timings = [
 				00 1C 07 07 23 22 07 07 05 02 04 00 18 17
+			];
+			qcom,display-topology = <1 1 1>,<2 2 1>;
+			qcom,default-topology-index = <1>;
+		};
+		timing@4 { /* WQHD+ 90hz 726Mhz 1452Mbps */
+			qcom,mdss-dsi-panel-phy-timings = [
+				00 2F 0C 0C 2A 27 0C 0D 09 02 04 00 26 1B
 			];
 			qcom,display-topology = <1 1 1>,<2 2 1>;
 			qcom,default-topology-index = <1>;
