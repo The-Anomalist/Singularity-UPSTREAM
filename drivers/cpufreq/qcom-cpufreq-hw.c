@@ -102,6 +102,7 @@ struct cpufreq_qcom {
 	u32 transition_hyst_khz;
 	u32 max_frequency_khz;
 	u64 last_freq_update_ns;
+	u32 last_scale_freq;
 	u32 last_index;
 	u32 blocked_up_transitions;
 	u32 blocked_down_transitions;
@@ -446,6 +447,7 @@ qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 	unsigned long flags;
 	u64 now;
 	bool rate_limited = false;
+	bool update_scale = false;
 
 	curr_index = readl_relaxed(c->reg_bases[REG_PERF_STATE]);
 	curr_index = min(curr_index, c->lut_max_entries - 1);
@@ -526,8 +528,17 @@ update_scale:
 	actual_freq = qcom_cpufreq_hw_get(policy->cpu);
 	if (!actual_freq)
 		actual_freq = curr_freq;
-	arch_set_freq_scale(policy->related_cpus, actual_freq,
-			    policy->cpuinfo.max_freq);
+
+	spin_lock_irqsave(&c->transition_lock, flags);
+	if (c->last_scale_freq != actual_freq) {
+		c->last_scale_freq = actual_freq;
+		update_scale = true;
+	}
+	spin_unlock_irqrestore(&c->transition_lock, flags);
+
+	if (update_scale)
+		arch_set_freq_scale(policy->related_cpus, actual_freq,
+				    policy->cpuinfo.max_freq);
 
 	return 0;
 }
