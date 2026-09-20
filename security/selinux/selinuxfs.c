@@ -44,10 +44,6 @@
 #include "conditional.h"
 
 
-#ifdef CONFIG_KSU
-extern struct selinux_state *ksu_selinux_hide_state_for_current(void);
-#endif
-
 enum sel_inos {
 	SEL_ROOT_INO = 2,
 	SEL_LOAD,	/* load policy */
@@ -227,9 +223,6 @@ static int sel_open_handle_status(struct inode *inode, struct file *filp)
 {
 	struct selinux_fs_info *fsi = file_inode(filp)->i_sb->s_fs_info;
 	struct selinux_state *state = fsi->state;
-#ifdef CONFIG_KSU
-	struct selinux_state *hidden_state;
-#endif
 	struct page *status;
 
 #ifdef CONFIG_KSU
@@ -238,9 +231,6 @@ static int sel_open_handle_status(struct inode *inode, struct file *filp)
 	 * the pristine policy state.  read() and mmap() both consume the page
 	 * stored in private_data, so redirecting it here covers both paths.
 	 */
-	hidden_state = ksu_selinux_hide_state_for_current();
-	if (hidden_state)
-		state = hidden_state;
 #endif
 
 	status = selinux_kernel_status_page(state);
@@ -625,18 +615,9 @@ static ssize_t sel_write_context(struct file *file, char *buf, size_t size)
 {
 	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
 	struct selinux_state *state = fsi->state;
-#ifdef CONFIG_KSU
-	struct selinux_state *hidden_state;
-#endif
 	char *canon = NULL;
 	u32 sid, len;
 	ssize_t length;
-
-#ifdef CONFIG_KSU
-	hidden_state = ksu_selinux_hide_state_for_current();
-	if (hidden_state)
-		state = hidden_state;
-#endif
 
 	length = avc_has_perm(&selinux_state,
 			      current_sid(), SECINITSID_SECURITY,
@@ -854,20 +835,11 @@ static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
 {
 	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
 	struct selinux_state *state = fsi->state;
-#ifdef CONFIG_KSU
-	struct selinux_state *hidden_state;
-#endif
 	char *scon = NULL, *tcon = NULL;
 	u32 ssid, tsid;
 	u16 tclass;
 	struct av_decision avd;
 	ssize_t length;
-
-#ifdef CONFIG_KSU
-	hidden_state = ksu_selinux_hide_state_for_current();
-	if (hidden_state)
-		state = hidden_state;
-#endif
 
 	length = avc_has_perm(&selinux_state,
 			      current_sid(), SECINITSID_SECURITY,
