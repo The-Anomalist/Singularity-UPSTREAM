@@ -2625,6 +2625,8 @@ out:
 		*lru_pages += size;
 		nr[lru] = scan;
 	}
+
+	lru_gen_adjust_scan(lruvec, sc->may_swap, nr);
 }
 
 /*

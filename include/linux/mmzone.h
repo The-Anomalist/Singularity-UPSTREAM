@@ -293,7 +293,7 @@ bool lru_gen_shrink_node(struct pglist_data *pgdat, struct scan_control *sc);
 void lru_gen_track_page_scan(struct lruvec *lruvec, enum lru_list lru,
 			     unsigned long nr_scanned, unsigned long nr_taken,
 			     unsigned long nr_reclaimed);
-void lru_gen_adjust_scan(struct lruvec *lruvec, struct scan_control *sc,
+void lru_gen_adjust_scan(struct lruvec *lruvec, bool may_swap,
 			 unsigned long *nr);
 void lru_gen_tune_memcg(struct lruvec *lruvec, struct scan_control *sc,
 			unsigned long reclaimed, unsigned long scanned);
@@ -332,7 +332,7 @@ static inline void lru_gen_track_page_scan(struct lruvec *lruvec,
 {
 }
 static inline void lru_gen_adjust_scan(struct lruvec *lruvec,
-				       struct scan_control *sc,
+				       bool may_swap,
 				       unsigned long *nr)
 {
 }

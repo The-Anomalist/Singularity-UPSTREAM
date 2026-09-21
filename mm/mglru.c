@@ -161,14 +161,15 @@ static bool lru_gen_should_age(struct lru_gen_struct *lrugen)
 	       SWAP_CLUSTER_MAX * 16;
 }
 
-static unsigned int lru_gen_pick_scan_type(struct lru_gen_struct *lrugen)
+static unsigned int lru_gen_pick_scan_type(struct lru_gen_struct *lrugen,
+					   bool may_swap)
 {
 	unsigned long anon = lrugen->pressure[LRU_GEN_ANON] + 1;
 	unsigned long file = lrugen->pressure[LRU_GEN_FILE] + 1;
 	unsigned long anon_old = lru_gen_count_old(lrugen, LRU_GEN_ANON);
 	unsigned long file_old = lru_gen_count_old(lrugen, LRU_GEN_FILE);
 
-	if (!total_swap_pages)
+	if (!may_swap || !total_swap_pages)
 		return LRU_GEN_FILE;
 
 	anon += anon_old / SWAP_CLUSTER_MAX;
@@ -408,7 +409,7 @@ void lru_gen_enter_reclaim(struct lruvec *lruvec, struct scan_control *sc)
 	spin_unlock_irq(&lruvec_pgdat(lruvec)->lru_lock);
 }
 
-void lru_gen_adjust_scan(struct lruvec *lruvec, struct scan_control *sc,
+void lru_gen_adjust_scan(struct lruvec *lruvec, bool may_swap,
 			 unsigned long *nr)
 {
 	struct lru_gen_struct *lrugen = &lruvec->lrugen;
@@ -472,9 +473,9 @@ void lru_gen_adjust_scan(struct lruvec *lruvec, struct scan_control *sc,
 	else if (file_old > anon_old)
 		file_weight += SWAP_CLUSTER_MAX / 2;
 
-	if (!total_swap_pages)
+	if (!may_swap || !total_swap_pages)
 		anon_weight = 0;
-	preferred = lru_gen_pick_scan_type(lrugen);
+	preferred = lru_gen_pick_scan_type(lrugen, may_swap);
 
 	if (preferred == LRU_GEN_ANON)
 		anon_weight += SWAP_CLUSTER_MAX;
@@ -485,16 +486,25 @@ void lru_gen_adjust_scan(struct lruvec *lruvec, struct scan_control *sc,
 	if (!denom)
 		return;
 
-	anon_scan = max_t(unsigned long, anon_scan,
-			  !anon_weight ? 0 : SWAP_CLUSTER_MAX);
-	file_scan = max_t(unsigned long, file_scan,
-			  !file_weight ? 0 : SWAP_CLUSTER_MAX);
-
+	/*
+	 * Split the existing scan budget without ever exceeding it.
+	 *
+	 * Do not impose SWAP_CLUSTER_MAX as an unconditional floor here:
+	 * reclaim frequently supplies smaller budgets, and forcing a larger
+	 * anon target would make file_scan underflow.
+	 */
 	if (anon_weight)
-		anon_scan = max_t(unsigned long, SWAP_CLUSTER_MAX,
-				  div64_u64((u64)total * anon_weight, denom));
+		anon_scan = div64_u64((u64)total * anon_weight, denom);
 	else
 		anon_scan = 0;
+
+	if (anon_weight && !anon_scan)
+		anon_scan = 1;
+
+	if (file_weight && anon_scan >= total && total > 1)
+		anon_scan = total - 1;
+
+	anon_scan = min(anon_scan, total);
 	file_scan = total - anon_scan;
 
 	nr[LRU_INACTIVE_ANON] = min(nr[LRU_INACTIVE_ANON], anon_scan);
