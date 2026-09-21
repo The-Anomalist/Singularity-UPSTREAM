@@ -1299,8 +1299,14 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 
 		switch (references) {
 		case PAGEREF_ACTIVATE:
+			lru_gen_note_page_referenced(
+				mem_cgroup_page_lruvec(page, pgdat),
+				page, true);
 			goto activate_locked;
 		case PAGEREF_KEEP:
+			lru_gen_note_page_referenced(
+				mem_cgroup_page_lruvec(page, pgdat),
+				page, true);
 			nr_ref_keep++;
 			goto keep_locked;
 		case PAGEREF_RECLAIM:
@@ -2083,8 +2089,14 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
 	if (nr_taken == 0)
 		return 0;
 
+	lru_gen_track_page_scan(lruvec, lru,
+				nr_scanned, nr_taken, 0);
+
 	nr_reclaimed = shrink_page_list(&page_list, pgdat, sc, 0,
 				&stat, false);
+
+	lru_gen_track_page_scan(lruvec, lru,
+				nr_scanned, nr_taken, nr_reclaimed);
 
 	spin_lock_irq(&pgdat->lru_lock);
 
@@ -2241,6 +2253,9 @@ static void shrink_active_list(unsigned long nr_to_scan,
 
 	spin_unlock_irq(&pgdat->lru_lock);
 
+	lru_gen_track_page_scan(lruvec, lru,
+				nr_scanned, nr_taken, 0);
+
 	while (!list_empty(&l_hold)) {
 		cond_resched();
 		page = lru_to_page(&l_hold);
@@ -2261,6 +2276,7 @@ static void shrink_active_list(unsigned long nr_to_scan,
 
 		if (page_referenced(page, 0, sc->target_mem_cgroup,
 				    &vm_flags)) {
+			lru_gen_note_page_referenced(lruvec, page, true);
 			nr_rotated += hpage_nr_pages(page);
 			/*
 			 * Identify referenced, file-backed active pages and
@@ -2828,6 +2844,9 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 	unsigned long nr_reclaimed, nr_scanned;
 	bool reclaimable = false;
 
+	if (lru_gen_enabled() && lru_gen_get_state())
+		lru_gen_enter_reclaim(node_lruvec(pgdat), sc);
+
 	do {
 		struct mem_cgroup *root = sc->target_mem_cgroup;
 		struct mem_cgroup_reclaim_cookie reclaim = {
@@ -2882,7 +2901,18 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 
 			reclaimed = sc->nr_reclaimed;
 			scanned = sc->nr_scanned;
+
+			if (lru_gen_enabled() && lru_gen_get_state())
+				lru_gen_enter_reclaim(
+					mem_cgroup_lruvec(pgdat, memcg), sc);
+
 			shrink_node_memcg(pgdat, memcg, sc, &lru_pages);
+
+			lru_gen_tune_memcg(
+				mem_cgroup_lruvec(pgdat, memcg), sc,
+				sc->nr_reclaimed - reclaimed,
+				sc->nr_scanned - scanned);
+
 			node_lru_pages += lru_pages;
 
 			shrink_slab(sc->gfp_mask, pgdat->node_id, memcg,

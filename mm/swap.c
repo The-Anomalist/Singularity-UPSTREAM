@@ -382,10 +382,15 @@ void mark_page_accessed(struct page *page)
 		 * pagevec, mark it active and it'll be moved to the active
 		 * LRU on the next drain.
 		 */
-		if (PageLRU(page))
+		if (PageLRU(page)) {
+			lru_gen_note_access(
+				mem_cgroup_page_lruvec(page,
+						      page_zone(page)->zone_pgdat),
+				page_is_file_cache(page));
 			activate_page(page);
-		else
+		} else {
 			__lru_cache_activate_page(page);
+		}
 		ClearPageReferenced(page);
 		if (page_is_file_cache(page))
 			workingset_activation(page);
