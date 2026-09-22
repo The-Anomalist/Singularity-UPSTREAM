@@ -47,22 +47,34 @@ static __always_inline void update_lru_size(struct lruvec *lruvec,
 static __always_inline void add_page_to_lru_list(struct page *page,
 				struct lruvec *lruvec, enum lru_list lru)
 {
-	update_lru_size(lruvec, lru, page_zonenum(page), hpage_nr_pages(page));
+	enum zone_type zid = page_zonenum(page);
+	int nr_pages = hpage_nr_pages(page);
+
+	update_lru_size(lruvec, lru, zid, nr_pages);
+	lru_gen_update_size(lruvec, page, lru, zid, nr_pages);
 	list_add(&page->lru, &lruvec->lists[lru]);
 }
 
 static __always_inline void add_page_to_lru_list_tail(struct page *page,
 				struct lruvec *lruvec, enum lru_list lru)
 {
-	update_lru_size(lruvec, lru, page_zonenum(page), hpage_nr_pages(page));
+	enum zone_type zid = page_zonenum(page);
+	int nr_pages = hpage_nr_pages(page);
+
+	update_lru_size(lruvec, lru, zid, nr_pages);
+	lru_gen_update_size(lruvec, page, lru, zid, nr_pages);
 	list_add_tail(&page->lru, &lruvec->lists[lru]);
 }
 
 static __always_inline void del_page_from_lru_list(struct page *page,
 				struct lruvec *lruvec, enum lru_list lru)
 {
+	enum zone_type zid = page_zonenum(page);
+	int nr_pages = hpage_nr_pages(page);
+
 	list_del(&page->lru);
-	update_lru_size(lruvec, lru, page_zonenum(page), -hpage_nr_pages(page));
+	lru_gen_update_size(lruvec, page, lru, zid, -nr_pages);
+	update_lru_size(lruvec, lru, zid, -nr_pages);
 }
 
 /**

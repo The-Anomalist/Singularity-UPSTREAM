@@ -72,66 +72,38 @@ static int __init init_lru_gen(void)
 }
 late_initcall(init_lru_gen);
 
-static void lru_gen_advance_seq(struct lruvec *lruvec)
+static void __maybe_unused lru_gen_advance_seq(struct lruvec *lruvec)
 {
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
-	unsigned long seq = lrugen->max_seq + 1;
-	unsigned int gen = seq % MAX_NR_GENS;
-	unsigned int type;
-
-	lrugen->max_seq = seq;
-	lrugen->timestamps[gen] = jiffies;
-
-	for (type = 0; type < ANON_AND_FILE; type++) {
-		if (lrugen->min_seq[type] + MIN_NR_GENS <= seq)
-			lrugen->min_seq[type] = seq - MIN_NR_GENS + 1;
-	}
+	/*
+	 * Diagnostic mode: keep MGLRU accounting active but prevent all
+	 * generation transitions. This isolates sequence advancement from
+	 * page-generation ownership and reclaim accounting.
+	 */
+	(void)lruvec;
 }
 
-static unsigned long lru_gen_count_old(struct lru_gen_struct *lrugen, int type)
-{
-	unsigned int zone;
-	unsigned long total = 0;
-	unsigned int gen = lrugen->min_seq[type] % MAX_NR_GENS;
-
-	for (zone = 0; zone < MAX_NR_ZONES; zone++)
-		total += max_t(long, 0, lrugen->nr_pages[gen][type][zone]);
-
-	return total;
-}
 
 static int lru_gen_lru_type(enum lru_list lru)
 {
 	return is_file_lru(lru) ? LRU_GEN_FILE : LRU_GEN_ANON;
 }
 
-void lru_gen_update_size(struct lruvec *lruvec, enum lru_list lru,
-			 enum zone_type zid, long delta)
+void lru_gen_update_size(struct lruvec *lruvec, struct page *page,
+			 enum lru_list lru, enum zone_type zid, long delta)
 {
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
-	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
-	unsigned long seq;
-	unsigned int type, gen;
-	long *nr_pages;
-
-	if (!lru_gen_enabled() || !lru_gen_get_state() || lru == LRU_UNEVICTABLE || !delta)
-		return;
-
-	lockdep_assert_held(&pgdat->lru_lock);
-
-	type = lru_gen_lru_type(lru);
-	seq = is_active_lru(lru) ? lrugen->max_seq : lrugen->min_seq[type];
-	gen = seq % MAX_NR_GENS;
-	nr_pages = &lrugen->nr_pages[gen][type][zid];
-
-	*nr_pages += delta;
-	if (*nr_pages < 0)
-		*nr_pages = 0;
-	if (delta > 0)
-		lrugen->timestamps[gen] = jiffies;
+	/*
+	 * Diagnostic mode:
+	 * disable all per-page MGLRU generation accounting while preserving
+	 * the higher-level reclaim and scan hooks.
+	 */
+	(void)lruvec;
+	(void)page;
+	(void)lru;
+	(void)zid;
+	(void)delta;
 }
 
-static void lru_gen_decay_pressure(struct lru_gen_struct *lrugen)
+static void __maybe_unused lru_gen_decay_pressure(struct lru_gen_struct *lrugen)
 {
 	unsigned int type;
 
@@ -139,46 +111,7 @@ static void lru_gen_decay_pressure(struct lru_gen_struct *lrugen)
 		lrugen->pressure[type] -= lrugen->pressure[type] >> 3;
 }
 
-static bool lru_gen_should_age(struct lru_gen_struct *lrugen)
-{
-	unsigned long gen = lrugen->max_seq % MAX_NR_GENS;
-	unsigned long age = jiffies - lrugen->timestamps[gen];
-	unsigned long age_period = msecs_to_jiffies(READ_ONCE(lru_gen_age_period_ms));
-	unsigned long anon_old = lru_gen_count_old(lrugen, LRU_GEN_ANON);
-	unsigned long file_old = lru_gen_count_old(lrugen, LRU_GEN_FILE);
 
-	if (age >= max_t(unsigned long, 1, age_period))
-		return true;
-
-	/*
-	 * Keep aging forward if the oldest generation accumulates enough
-	 * pages, even under light reclaim pressure.
-	 */
-	if (anon_old + file_old >= SWAP_CLUSTER_MAX * 32)
-		return true;
-
-	return lrugen->pressure[LRU_GEN_ANON] + lrugen->pressure[LRU_GEN_FILE] >=
-	       SWAP_CLUSTER_MAX * 16;
-}
-
-static unsigned int lru_gen_pick_scan_type(struct lru_gen_struct *lrugen,
-					   bool may_swap)
-{
-	unsigned long anon = lrugen->pressure[LRU_GEN_ANON] + 1;
-	unsigned long file = lrugen->pressure[LRU_GEN_FILE] + 1;
-	unsigned long anon_old = lru_gen_count_old(lrugen, LRU_GEN_ANON);
-	unsigned long file_old = lru_gen_count_old(lrugen, LRU_GEN_FILE);
-
-	if (!may_swap || !total_swap_pages)
-		return LRU_GEN_FILE;
-
-	anon += anon_old / SWAP_CLUSTER_MAX;
-	file += file_old / SWAP_CLUSTER_MAX;
-	anon += lrugen->tiers[LRU_GEN_ANON] * SWAP_CLUSTER_MAX;
-	file += lrugen->tiers[LRU_GEN_FILE] * SWAP_CLUSTER_MAX;
-
-	return anon >= file ? LRU_GEN_ANON : LRU_GEN_FILE;
-}
 
 bool lru_gen_enabled(void)
 {
@@ -197,13 +130,12 @@ int lru_gen_set_state(bool enable)
 	if (old == enable)
 		return 0;
 
-	WRITE_ONCE(lru_gen_boot_enabled, enable);
-	if (enable)
-		static_branch_enable(&lru_gen_caps);
-	else
-		static_branch_disable(&lru_gen_caps);
-
-	return 0;
+	/*
+	 * Runtime transitions are unsafe in this backport because existing
+	 * pages are not walked and assigned generation ownership. MGLRU must
+	 * therefore remain in the state selected during boot.
+	 */
+	return -EBUSY;
 }
 
 int lru_gen_set_min_ttl(unsigned int ttl_ms)
@@ -312,10 +244,8 @@ void lru_gen_note_access(struct lruvec *lruvec, bool file)
 	 * Age generations when enough new accesses arrive, so the reclaim
 	 * side can keep selecting truly older generations.
 	 */
-	if (lrugen->accessed[type] >= SWAP_CLUSTER_MAX * 4) {
+	if (lrugen->accessed[type] >= SWAP_CLUSTER_MAX * 4)
 		lrugen->accessed[type] = 0;
-		lru_gen_advance_seq(lruvec);
-	}
 	spin_unlock_irq(&lruvec_pgdat(lruvec)->lru_lock);
 }
 
@@ -343,10 +273,8 @@ void lru_gen_note_page_referenced(struct lruvec *lruvec, struct page *page,
 	if (from_reclaim)
 		lrugen->pressure[type] += min_t(unsigned long, nr_pages, SWAP_CLUSTER_MAX);
 
-	if (lrugen->accessed[type] >= threshold) {
+	if (lrugen->accessed[type] >= threshold)
 		lrugen->accessed[type] = 0;
-		lru_gen_advance_seq(lruvec);
-	}
 	spin_unlock_irq(&lruvec_pgdat(lruvec)->lru_lock);
 }
 
@@ -378,199 +306,60 @@ void lru_gen_note_lru_move(struct lruvec *lruvec, enum lru_list old_lru,
 void lru_gen_enter_reclaim(struct lruvec *lruvec, struct scan_control *sc)
 {
 	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+	unsigned long flags;
 	unsigned int gen;
-	unsigned int type;
 
 	(void)sc;
 
 	if (!lru_gen_enabled() || !lru_gen_get_state())
 		return;
 
-	spin_lock_irq(&lruvec_pgdat(lruvec)->lru_lock);
-	gen = lrugen->max_seq % MAX_NR_GENS;
-	if (lrugen->timestamps[gen] + HZ / 4 < jiffies)
-		lrugen->timestamps[gen] = jiffies;
-	if (lru_gen_should_age(lrugen)) {
-		lrugen->evicted[LRU_GEN_ANON] = 0;
-		lrugen->evicted[LRU_GEN_FILE] = 0;
-		lru_gen_advance_seq(lruvec);
+	/*
+	 * Diagnostic mode:
+	 * reclaim may call this for the node and for every memcg. Never
+	 * spin waiting for the shared pgdat LRU lock here; skip the hint
+	 * if normal reclaim currently owns it.
+	 */
+	local_irq_save(flags);
+
+	if (!spin_trylock(&pgdat->lru_lock)) {
+		local_irq_restore(flags);
+		return;
 	}
 
-	/*
-	 * Reclaim path for the oldest generations:
-	 * if an oldest generation is already drained, move its floor forward so
-	 * reclaim naturally shifts to the next oldest generation.
-	 */
-	for (type = 0; type < ANON_AND_FILE; type++) {
-		if (!lru_gen_count_old(lrugen, type) &&
-		    lrugen->min_seq[type] < lrugen->max_seq)
-			lrugen->min_seq[type]++;
-	}
-	spin_unlock_irq(&lruvec_pgdat(lruvec)->lru_lock);
+	gen = lrugen->max_seq % MAX_NR_GENS;
+	if (time_before(lrugen->timestamps[gen] + HZ / 4, jiffies))
+		lrugen->timestamps[gen] = jiffies;
+
+	spin_unlock(&pgdat->lru_lock);
+	local_irq_restore(flags);
 }
 
 void lru_gen_adjust_scan(struct lruvec *lruvec, bool may_swap,
 			 unsigned long *nr)
 {
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
-	unsigned long anon_scan;
-	unsigned long file_scan;
-	unsigned long total;
-	unsigned long denom;
-	unsigned long anon_weight;
-	unsigned long file_weight;
-	unsigned long anon_old = 0;
-	unsigned long file_old = 0;
-	unsigned long anon_old_age = 0;
-	unsigned long file_old_age = 0;
-	unsigned long min_ttl;
-	unsigned long min_ttl_jiffies;
-	unsigned int preferred;
-	unsigned int zone;
-
-	if (!lru_gen_enabled() || !lru_gen_get_state())
-		return;
-
-	anon_scan = nr[LRU_INACTIVE_ANON] + nr[LRU_ACTIVE_ANON];
-	file_scan = nr[LRU_INACTIVE_FILE] + nr[LRU_ACTIVE_FILE];
-	total = anon_scan + file_scan;
-	if (!total)
-		return;
-
 	/*
-	 * Eviction decision stage:
-	 * steer scan pressure toward colder generations using pressure[].
-	 * Keep at least one cluster of each type to avoid starvation.
+	 * Diagnostic mode:
+	 * leave legacy reclaim scan targets completely untouched.
 	 */
-	anon_weight = lrugen->pressure[LRU_GEN_ANON] + 1;
-	file_weight = lrugen->pressure[LRU_GEN_FILE] + 1;
-
-	for (zone = 0; zone < MAX_NR_ZONES; zone++) {
-		anon_old += lrugen->nr_pages[lrugen->min_seq[LRU_GEN_ANON] % MAX_NR_GENS]
-					  [LRU_GEN_ANON][zone];
-		file_old += lrugen->nr_pages[lrugen->min_seq[LRU_GEN_FILE] % MAX_NR_GENS]
-					  [LRU_GEN_FILE][zone];
-	}
-	anon_old_age = jiffies - lrugen->timestamps[lrugen->min_seq[LRU_GEN_ANON] % MAX_NR_GENS];
-	file_old_age = jiffies - lrugen->timestamps[lrugen->min_seq[LRU_GEN_FILE] % MAX_NR_GENS];
-	min_ttl = READ_ONCE(lru_gen_min_ttl_ms);
-	min_ttl_jiffies = msecs_to_jiffies(min_ttl);
-
-	anon_weight += anon_old / SWAP_CLUSTER_MAX;
-	file_weight += file_old / SWAP_CLUSTER_MAX;
-
-	/*
-	 * Respect optional working-set protection: until the oldest generation
-	 * reaches min_ttl, de-emphasize it instead of scanning it aggressively.
-	 */
-	if (min_ttl && anon_old_age < min_ttl_jiffies)
-		anon_weight >>= 1;
-	if (min_ttl && file_old_age < min_ttl_jiffies)
-		file_weight >>= 1;
-
-	if (anon_old > file_old)
-		anon_weight += SWAP_CLUSTER_MAX / 2;
-	else if (file_old > anon_old)
-		file_weight += SWAP_CLUSTER_MAX / 2;
-
-	if (!may_swap || !total_swap_pages)
-		anon_weight = 0;
-	preferred = lru_gen_pick_scan_type(lrugen, may_swap);
-
-	if (preferred == LRU_GEN_ANON)
-		anon_weight += SWAP_CLUSTER_MAX;
-	else
-		file_weight += SWAP_CLUSTER_MAX;
-
-	denom = anon_weight + file_weight;
-	if (!denom)
-		return;
-
-	/*
-	 * Split the existing scan budget without ever exceeding it.
-	 *
-	 * Do not impose SWAP_CLUSTER_MAX as an unconditional floor here:
-	 * reclaim frequently supplies smaller budgets, and forcing a larger
-	 * anon target would make file_scan underflow.
-	 */
-	if (anon_weight)
-		anon_scan = div64_u64((u64)total * anon_weight, denom);
-	else
-		anon_scan = 0;
-
-	if (anon_weight && !anon_scan)
-		anon_scan = 1;
-
-	if (file_weight && anon_scan >= total && total > 1)
-		anon_scan = total - 1;
-
-	anon_scan = min(anon_scan, total);
-	file_scan = total - anon_scan;
-
-	nr[LRU_INACTIVE_ANON] = min(nr[LRU_INACTIVE_ANON], anon_scan);
-	nr[LRU_ACTIVE_ANON] = anon_scan - nr[LRU_INACTIVE_ANON];
-	nr[LRU_INACTIVE_FILE] = min(nr[LRU_INACTIVE_FILE], file_scan);
-	nr[LRU_ACTIVE_FILE] = file_scan - nr[LRU_INACTIVE_FILE];
+	(void)lruvec;
+	(void)may_swap;
+	(void)nr;
 }
 
 void lru_gen_tune_memcg(struct lruvec *lruvec, struct scan_control *sc,
-			unsigned long reclaimed, unsigned long scanned)
+                        unsigned long reclaimed, unsigned long scanned)
 {
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
-	unsigned int anon_tier, file_tier;
-	unsigned long efficiency, split;
-	unsigned long now = jiffies;
-	unsigned long anon_eff = 0, file_eff = 0;
-
-	if (!lru_gen_enabled() || !lru_gen_get_state() || !scanned)
-		return;
-
 	/*
-	 * memcg/tier tuning stage:
-	 * derive a coarse reclaim tier based on observed reclaim efficiency.
+	 * Diagnostic mode:
+	 * disable reclaim-feedback aging/tiering while isolating the
+	 * MGLRU hard-freeze.
 	 */
-	efficiency = reclaimed * 100 / scanned;
-	anon_tier = min_t(unsigned int, MAX_NR_GENS - 1,
-			  lrugen->pressure[LRU_GEN_ANON] / (8 * SWAP_CLUSTER_MAX));
-	file_tier = min_t(unsigned int, MAX_NR_GENS - 1,
-			  lrugen->pressure[LRU_GEN_FILE] / (8 * SWAP_CLUSTER_MAX));
-
-	if (efficiency < 10) {
-		anon_tier = min_t(unsigned int, anon_tier + 1, MAX_NR_GENS - 1);
-		file_tier = min_t(unsigned int, file_tier + 1, MAX_NR_GENS - 1);
-	} else if (efficiency > 50) {
-		anon_tier = anon_tier ? anon_tier - 1 : 0;
-		file_tier = file_tier ? file_tier - 1 : 0;
-	}
-
-	lrugen->tiers[LRU_GEN_ANON] = anon_tier;
-	lrugen->tiers[LRU_GEN_FILE] = file_tier;
-
-	split = max_t(unsigned long, 1, scanned / 2);
-	if (reclaimed)
-		anon_eff = min_t(unsigned long, reclaimed, split) * 100 / split;
-	if (scanned > split)
-		file_eff = (reclaimed > split ? reclaimed - split : 0) * 100 /
-			   (scanned - split);
-
-	if (anon_eff + 5 < file_eff)
-		lrugen->pressure[LRU_GEN_ANON] += SWAP_CLUSTER_MAX / 2;
-	else if (file_eff + 5 < anon_eff)
-		lrugen->pressure[LRU_GEN_FILE] += SWAP_CLUSTER_MAX / 2;
-
-	lru_gen_decay_pressure(lrugen);
-
-	/*
-	 * Tier-aware aging: advance generations faster when reclaim is weak or
-	 * when higher tiers are selected by pressure feedback.
-	 */
-	if (efficiency < 20 || anon_tier + file_tier >= MAX_NR_GENS ||
-	    now - lrugen->last_reclaim >= HZ) {
-		spin_lock_irq(&lruvec_pgdat(lruvec)->lru_lock);
-		lru_gen_advance_seq(lruvec);
-		spin_unlock_irq(&lruvec_pgdat(lruvec)->lru_lock);
-	}
-	lrugen->last_reclaim = now;
+	(void)lruvec;
+	(void)sc;
+	(void)reclaimed;
+	(void)scanned;
 }
 
 /*

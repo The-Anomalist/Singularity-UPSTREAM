@@ -1833,6 +1833,8 @@ static unsigned long isolate_lru_pages(unsigned long nr_to_scan,
 			nr_pages = hpage_nr_pages(page);
 			nr_taken += nr_pages;
 			nr_zone_taken[page_zonenum(page)] += nr_pages;
+			lru_gen_update_size(lruvec, page, lru,
+					    page_zonenum(page), -nr_pages);
 			list_move(&page->lru, dst);
 			break;
 
@@ -2188,6 +2190,8 @@ static unsigned move_active_pages_to_lru(struct lruvec *lruvec,
 
 		nr_pages = hpage_nr_pages(page);
 		update_lru_size(lruvec, lru, page_zonenum(page), nr_pages);
+		lru_gen_update_size(lruvec, page, lru, page_zonenum(page),
+				    nr_pages);
 		list_move(&page->lru, &lruvec->lists[lru]);
 
 		if (put_page_testzero(page)) {

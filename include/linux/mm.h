@@ -912,6 +912,7 @@ vm_fault_t finish_mkwrite_fault(struct vm_fault *vmf);
 #define ZONES_PGOFF		(NODES_PGOFF - ZONES_WIDTH)
 #define LAST_CPUPID_PGOFF	(ZONES_PGOFF - LAST_CPUPID_WIDTH)
 #define KASAN_TAG_PGOFF		(LAST_CPUPID_PGOFF - KASAN_TAG_WIDTH)
+#define LRU_GEN_PGOFF		(KASAN_TAG_PGOFF - LRU_GEN_WIDTH)
 
 /*
  * Define the bit shifts to access each section.  For non-existent
@@ -923,6 +924,7 @@ vm_fault_t finish_mkwrite_fault(struct vm_fault *vmf);
 #define ZONES_PGSHIFT		(ZONES_PGOFF * (ZONES_WIDTH != 0))
 #define LAST_CPUPID_PGSHIFT	(LAST_CPUPID_PGOFF * (LAST_CPUPID_WIDTH != 0))
 #define KASAN_TAG_PGSHIFT	(KASAN_TAG_PGOFF * (KASAN_TAG_WIDTH != 0))
+#define LRU_GEN_PGSHIFT		(LRU_GEN_PGOFF * (LRU_GEN_WIDTH != 0))
 
 /* NODE:ZONE or SECTION:ZONE is used to ID a zone for the buddy allocator */
 #ifdef NODE_NOT_IN_PAGE_FLAGS
@@ -946,12 +948,41 @@ vm_fault_t finish_mkwrite_fault(struct vm_fault *vmf);
 #define SECTIONS_MASK		((1UL << SECTIONS_WIDTH) - 1)
 #define LAST_CPUPID_MASK	((1UL << LAST_CPUPID_SHIFT) - 1)
 #define KASAN_TAG_MASK		((1UL << KASAN_TAG_WIDTH) - 1)
+#define LRU_GEN_MASK		((1UL << LRU_GEN_WIDTH) - 1)
 #define ZONEID_MASK		((1UL << ZONEID_SHIFT) - 1)
 
 static inline enum zone_type page_zonenum(const struct page *page)
 {
 	return (page->flags >> ZONES_PGSHIFT) & ZONES_MASK;
 }
+
+#ifdef CONFIG_LRU_GEN
+static inline int page_lru_gen(const struct page *page)
+{
+	/*
+	 * Diagnostic mode: do not read generation ownership from page->flags.
+	 */
+	(void)page;
+	return -1;
+}
+
+static inline void page_set_lru_gen(struct page *page, unsigned int gen)
+{
+	/*
+	 * Diagnostic mode: do not modify page->flags.
+	 */
+	(void)page;
+	(void)gen;
+}
+
+static inline void page_clear_lru_gen(struct page *page)
+{
+	/*
+	 * Diagnostic mode: do not modify page->flags.
+	 */
+	(void)page;
+}
+#endif
 
 #ifdef CONFIG_ZONE_DEVICE
 static inline bool is_zone_device_page(const struct page *page)

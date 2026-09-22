@@ -17,6 +17,7 @@
 #include <linux/nodemask.h>
 #include <linux/pageblock-flags.h>
 #include <linux/page-flags-layout.h>
+#include <linux/lru_gen.h>
 #include <linux/atomic.h>
 #include <linux/android_kabi.h>
 #include <asm/page.h>
@@ -252,9 +253,6 @@ struct zone_reclaim_stat {
 enum zone_type;
 
 #ifdef CONFIG_LRU_GEN
-#define MIN_NR_GENS	2U
-#define MAX_NR_GENS	4U
-
 enum {
 	LRU_GEN_ANON,
 	LRU_GEN_FILE,
@@ -303,8 +301,8 @@ void lru_gen_note_page_referenced(struct lruvec *lruvec, struct page *page,
 void lru_gen_note_lru_move(struct lruvec *lruvec, enum lru_list old_lru,
 			   enum lru_list new_lru, unsigned long nr_pages);
 void lru_gen_enter_reclaim(struct lruvec *lruvec, struct scan_control *sc);
-void lru_gen_update_size(struct lruvec *lruvec, enum lru_list lru,
-			 enum zone_type zid, long delta);
+void lru_gen_update_size(struct lruvec *lruvec, struct page *page,
+			 enum lru_list lru, enum zone_type zid, long delta);
 int lru_gen_set_state(bool enable);
 int lru_gen_get_state(void);
 int lru_gen_set_min_ttl(unsigned int ttl_ms);
@@ -361,8 +359,8 @@ static inline void lru_gen_enter_reclaim(struct lruvec *lruvec,
 {
 }
 static inline void lru_gen_update_size(struct lruvec *lruvec,
-				       enum lru_list lru, enum zone_type zid,
-				       long delta)
+				       struct page *page, enum lru_list lru,
+				       enum zone_type zid, long delta)
 {
 }
 static inline int lru_gen_set_state(bool enable)

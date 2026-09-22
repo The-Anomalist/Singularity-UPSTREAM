@@ -11,6 +11,7 @@
 #include <linux/mmzone.h>
 #include <linux/kbuild.h>
 #include <linux/log2.h>
+#include <linux/lru_gen.h>
 #include <linux/spinlock_types.h>
 
 int main(void)
@@ -18,6 +19,11 @@ int main(void)
 	/* The enum constants to put into include/generated/bounds.h */
 	DEFINE(NR_PAGEFLAGS, __NR_PAGEFLAGS);
 	DEFINE(MAX_NR_ZONES, __MAX_NR_ZONES);
+#ifdef CONFIG_LRU_GEN
+	DEFINE(LRU_GEN_WIDTH, order_base_2(MAX_NR_GENS + 1));
+#else
+	DEFINE(LRU_GEN_WIDTH, 0);
+#endif
 #ifdef CONFIG_SMP
 	DEFINE(NR_CPUS_BITS, ilog2(CONFIG_NR_CPUS));
 #endif
