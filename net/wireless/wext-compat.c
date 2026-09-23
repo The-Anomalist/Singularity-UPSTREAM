@@ -1473,39 +1473,113 @@ static int cfg80211_wext_siwpmksa(struct net_device *dev,
 	}
 }
 
+
+/*
+ * Wireless Extensions predates Clang CFI and its handlers use a number
+ * of specialized argument types which are cast to iw_handler in the
+ * dispatch table.  Those casts are ABI-compatible at runtime, but they
+ * violate CFI's indirect-call type checking.
+ *
+ * Keep the existing typed helpers intact and route the handler table
+ * through adapters with the exact iw_handler prototype.
+ */
+#define CFG80211_WEXT_CFI_WRAPPER(_name, _member)                     \
+static int _name##_cfi(struct net_device *dev,                        \
+                       struct iw_request_info *info,                   \
+                       union iwreq_data *wrqu, char *extra)            \
+{                                                                      \
+        return _name(dev, info, &wrqu->_member, extra);               \
+}
+
+#define CFG80211_WEXT_CFI_WRAPPER_ARRAY(_name, _member)               \
+static int _name##_cfi(struct net_device *dev,                        \
+                       struct iw_request_info *info,                   \
+                       union iwreq_data *wrqu, char *extra)            \
+{                                                                      \
+        return _name(dev, info, wrqu->_member, extra);                \
+}
+
+CFG80211_WEXT_CFI_WRAPPER_ARRAY(cfg80211_wext_giwname, name)
+
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_siwfreq, freq)
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_giwfreq, freq)
+
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_siwmode, mode)
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_giwmode, mode)
+
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_giwrange, data)
+
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_siwap, ap_addr)
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_giwap, ap_addr)
+
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_siwmlme, data)
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_giwscan, data)
+
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_siwessid, essid)
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_giwessid, essid)
+
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_siwrate, bitrate)
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_giwrate, bitrate)
+
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_siwrts, rts)
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_giwrts, rts)
+
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_siwfrag, frag)
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_giwfrag, frag)
+
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_siwretry, retry)
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_giwretry, retry)
+
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_siwencode, encoding)
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_giwencode, encoding)
+
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_siwpower, power)
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_giwpower, power)
+
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_siwgenie, data)
+
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_siwauth, param)
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_giwauth, param)
+
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_siwencodeext, data)
+CFG80211_WEXT_CFI_WRAPPER(cfg80211_wext_siwpmksa, data)
+
+#undef CFG80211_WEXT_CFI_WRAPPER
+#undef CFG80211_WEXT_CFI_WRAPPER_ARRAY
+
 static const iw_handler cfg80211_handlers[] = {
-	[IW_IOCTL_IDX(SIOCGIWNAME)]	= (iw_handler) cfg80211_wext_giwname,
-	[IW_IOCTL_IDX(SIOCSIWFREQ)]	= (iw_handler) cfg80211_wext_siwfreq,
-	[IW_IOCTL_IDX(SIOCGIWFREQ)]	= (iw_handler) cfg80211_wext_giwfreq,
-	[IW_IOCTL_IDX(SIOCSIWMODE)]	= (iw_handler) cfg80211_wext_siwmode,
-	[IW_IOCTL_IDX(SIOCGIWMODE)]	= (iw_handler) cfg80211_wext_giwmode,
-	[IW_IOCTL_IDX(SIOCGIWRANGE)]	= (iw_handler) cfg80211_wext_giwrange,
-	[IW_IOCTL_IDX(SIOCSIWAP)]	= (iw_handler) cfg80211_wext_siwap,
-	[IW_IOCTL_IDX(SIOCGIWAP)]	= (iw_handler) cfg80211_wext_giwap,
-	[IW_IOCTL_IDX(SIOCSIWMLME)]	= (iw_handler) cfg80211_wext_siwmlme,
-	[IW_IOCTL_IDX(SIOCSIWSCAN)]	= (iw_handler) cfg80211_wext_siwscan,
-	[IW_IOCTL_IDX(SIOCGIWSCAN)]	= (iw_handler) cfg80211_wext_giwscan,
-	[IW_IOCTL_IDX(SIOCSIWESSID)]	= (iw_handler) cfg80211_wext_siwessid,
-	[IW_IOCTL_IDX(SIOCGIWESSID)]	= (iw_handler) cfg80211_wext_giwessid,
-	[IW_IOCTL_IDX(SIOCSIWRATE)]	= (iw_handler) cfg80211_wext_siwrate,
-	[IW_IOCTL_IDX(SIOCGIWRATE)]	= (iw_handler) cfg80211_wext_giwrate,
-	[IW_IOCTL_IDX(SIOCSIWRTS)]	= (iw_handler) cfg80211_wext_siwrts,
-	[IW_IOCTL_IDX(SIOCGIWRTS)]	= (iw_handler) cfg80211_wext_giwrts,
-	[IW_IOCTL_IDX(SIOCSIWFRAG)]	= (iw_handler) cfg80211_wext_siwfrag,
-	[IW_IOCTL_IDX(SIOCGIWFRAG)]	= (iw_handler) cfg80211_wext_giwfrag,
-	[IW_IOCTL_IDX(SIOCSIWTXPOW)]	= (iw_handler) cfg80211_wext_siwtxpower,
-	[IW_IOCTL_IDX(SIOCGIWTXPOW)]	= (iw_handler) cfg80211_wext_giwtxpower,
-	[IW_IOCTL_IDX(SIOCSIWRETRY)]	= (iw_handler) cfg80211_wext_siwretry,
-	[IW_IOCTL_IDX(SIOCGIWRETRY)]	= (iw_handler) cfg80211_wext_giwretry,
-	[IW_IOCTL_IDX(SIOCSIWENCODE)]	= (iw_handler) cfg80211_wext_siwencode,
-	[IW_IOCTL_IDX(SIOCGIWENCODE)]	= (iw_handler) cfg80211_wext_giwencode,
-	[IW_IOCTL_IDX(SIOCSIWPOWER)]	= (iw_handler) cfg80211_wext_siwpower,
-	[IW_IOCTL_IDX(SIOCGIWPOWER)]	= (iw_handler) cfg80211_wext_giwpower,
-	[IW_IOCTL_IDX(SIOCSIWGENIE)]	= (iw_handler) cfg80211_wext_siwgenie,
-	[IW_IOCTL_IDX(SIOCSIWAUTH)]	= (iw_handler) cfg80211_wext_siwauth,
-	[IW_IOCTL_IDX(SIOCGIWAUTH)]	= (iw_handler) cfg80211_wext_giwauth,
-	[IW_IOCTL_IDX(SIOCSIWENCODEEXT)]= (iw_handler) cfg80211_wext_siwencodeext,
-	[IW_IOCTL_IDX(SIOCSIWPMKSA)]	= (iw_handler) cfg80211_wext_siwpmksa,
+	[IW_IOCTL_IDX(SIOCGIWNAME)]	= cfg80211_wext_giwname_cfi,
+	[IW_IOCTL_IDX(SIOCSIWFREQ)]	= cfg80211_wext_siwfreq_cfi,
+	[IW_IOCTL_IDX(SIOCGIWFREQ)]	= cfg80211_wext_giwfreq_cfi,
+	[IW_IOCTL_IDX(SIOCSIWMODE)]	= cfg80211_wext_siwmode_cfi,
+	[IW_IOCTL_IDX(SIOCGIWMODE)]	= cfg80211_wext_giwmode_cfi,
+	[IW_IOCTL_IDX(SIOCGIWRANGE)]	= cfg80211_wext_giwrange_cfi,
+	[IW_IOCTL_IDX(SIOCSIWAP)]	= cfg80211_wext_siwap_cfi,
+	[IW_IOCTL_IDX(SIOCGIWAP)]	= cfg80211_wext_giwap_cfi,
+	[IW_IOCTL_IDX(SIOCSIWMLME)]	= cfg80211_wext_siwmlme_cfi,
+	[IW_IOCTL_IDX(SIOCSIWSCAN)]	= cfg80211_wext_siwscan,
+	[IW_IOCTL_IDX(SIOCGIWSCAN)]	= cfg80211_wext_giwscan_cfi,
+	[IW_IOCTL_IDX(SIOCSIWESSID)]	= cfg80211_wext_siwessid_cfi,
+	[IW_IOCTL_IDX(SIOCGIWESSID)]	= cfg80211_wext_giwessid_cfi,
+	[IW_IOCTL_IDX(SIOCSIWRATE)]	= cfg80211_wext_siwrate_cfi,
+	[IW_IOCTL_IDX(SIOCGIWRATE)]	= cfg80211_wext_giwrate_cfi,
+	[IW_IOCTL_IDX(SIOCSIWRTS)]	= cfg80211_wext_siwrts_cfi,
+	[IW_IOCTL_IDX(SIOCGIWRTS)]	= cfg80211_wext_giwrts_cfi,
+	[IW_IOCTL_IDX(SIOCSIWFRAG)]	= cfg80211_wext_siwfrag_cfi,
+	[IW_IOCTL_IDX(SIOCGIWFRAG)]	= cfg80211_wext_giwfrag_cfi,
+	[IW_IOCTL_IDX(SIOCSIWTXPOW)]	= cfg80211_wext_siwtxpower,
+	[IW_IOCTL_IDX(SIOCGIWTXPOW)]	= cfg80211_wext_giwtxpower,
+	[IW_IOCTL_IDX(SIOCSIWRETRY)]	= cfg80211_wext_siwretry_cfi,
+	[IW_IOCTL_IDX(SIOCGIWRETRY)]	= cfg80211_wext_giwretry_cfi,
+	[IW_IOCTL_IDX(SIOCSIWENCODE)]	= cfg80211_wext_siwencode_cfi,
+	[IW_IOCTL_IDX(SIOCGIWENCODE)]	= cfg80211_wext_giwencode_cfi,
+	[IW_IOCTL_IDX(SIOCSIWPOWER)]	= cfg80211_wext_siwpower_cfi,
+	[IW_IOCTL_IDX(SIOCGIWPOWER)]	= cfg80211_wext_giwpower_cfi,
+	[IW_IOCTL_IDX(SIOCSIWGENIE)]	= cfg80211_wext_siwgenie_cfi,
+	[IW_IOCTL_IDX(SIOCSIWAUTH)]	= cfg80211_wext_siwauth_cfi,
+	[IW_IOCTL_IDX(SIOCGIWAUTH)]	= cfg80211_wext_giwauth_cfi,
+	[IW_IOCTL_IDX(SIOCSIWENCODEEXT)]= cfg80211_wext_siwencodeext_cfi,
+	[IW_IOCTL_IDX(SIOCSIWPMKSA)]	= cfg80211_wext_siwpmksa_cfi,
 };
 
 const struct iw_handler_def cfg80211_wext_handler = {
