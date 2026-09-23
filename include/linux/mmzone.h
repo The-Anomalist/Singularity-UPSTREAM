@@ -360,7 +360,7 @@ static inline void lru_gen_enter_reclaim(struct lruvec *lruvec,
 }
 static inline void lru_gen_update_size(struct lruvec *lruvec,
 				       struct page *page, enum lru_list lru,
-				       enum zone_type zid, long delta)
+				       int zid, long delta)
 {
 }
 static inline int lru_gen_set_state(bool enable)
