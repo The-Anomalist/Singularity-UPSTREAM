@@ -17,20 +17,6 @@
 	gpubw: qcom,gpubw {
 		compatible = "qcom,devbw-ddr";
 		governor = "bw_vbif";
-		interconnects = <&kona_icc KONA_ICC_GPU_TO_LLCC>,
-				<&kona_icc KONA_ICC_GPU_TO_MEM>;
-		interconnect-names = "gpu-llcc", "gpu-ddr";
-		/*
-		 * Keep both GPU memory paths at the requested sustaining vote and
-		 * add modest headroom so short benchmark bursts don't undershoot
-		 * after the move to ICC voting.
-		 */
-		qcom,icc-no-split-ab-kbps;
-		qcom,icc-boost-percent = <150>;
-		qcom,polling-ms = <8>;
-		qcom,icc-upscale-percent = <240>;
-		qcom,icc-min-avg-kbps = <2812500>;
-		qcom,icc-min-peak-kbps = <11250000>;
 		qcom,src-dst-ports = <26 512>;
 		operating-points-v2 = <&suspendable_ddr_bw_opp_table>;
 	};
@@ -38,44 +24,18 @@
 	gpu_opp_table: gpu-opp-table {
 		compatible = "operating-points-v2";
 
-		opp-938000000 {
-			opp-hz = /bits/ 64 <938000000>;
-			opp-microvolt = <RPMH_REGULATOR_LEVEL_TURBO_L1>;
-		};
-		opp-840000000 {
-			opp-hz = /bits/ 64 <840000000>;
-			opp-microvolt = <RPMH_REGULATOR_LEVEL_TURBO>;
-		};
-		opp-760000000 {
-			opp-hz = /bits/ 64 <760000000>;
-			opp-microvolt = <RPMH_REGULATOR_LEVEL_NOM_L1>;
-		};
-		opp-670000000 {
-			opp-hz = /bits/ 64 <670000000>;
-			opp-microvolt = <RPMH_REGULATOR_LEVEL_NOM>;
-		};
-		opp-587000000 {
-			opp-hz = /bits/ 64 <587000000>;
-			opp-microvolt = <RPMH_REGULATOR_LEVEL_SVS_L2>;
-		};
-		opp-525000000 {
-			opp-hz = /bits/ 64 <525000000>;
+		opp-480000000 {
+			opp-hz = /bits/ 64 <480000000>;
 			opp-microvolt = <RPMH_REGULATOR_LEVEL_SVS_L1>;
 		};
-		opp-430000000 {
-			opp-hz = /bits/ 64 <430000000>;
-			opp-microvolt = <RPMH_REGULATOR_LEVEL_SVS_L0>;
-		};
-		opp-360000000 {
-			opp-hz = /bits/ 64 <360000000>;
+
+		opp-381000000 {
+			opp-hz = /bits/ 64 <381000000>;
 			opp-microvolt = <RPMH_REGULATOR_LEVEL_SVS>;
 		};
-		opp-300000000 {
-			opp-hz = /bits/ 64 <300000000>;
-			opp-microvolt = <RPMH_REGULATOR_LEVEL_LOW_SVS>;
-		};
-		opp-257000000 {
-			opp-hz = /bits/ 64 <257000000>;
+
+		opp-290000000 {
+			opp-hz = /bits/ 64 <290000000>;
 			opp-microvolt = <RPMH_REGULATOR_LEVEL_LOW_SVS>;
 		};
 	};
@@ -95,11 +55,11 @@
 
 		qcom,chipid = <0x06050000>;
 
-		qcom,initial-pwrlevel = <8>;
+		qcom,initial-pwrlevel = <2>;
 
-		qcom,idle-timeout = <120>; /* msecs */
+		qcom,idle-timeout = <80>; /* msecs */
 
-		/* Let an idle GPU enter NAP/SLUMBER and gate the GX clock. */
+		qcom,no-nap;
 
 		qcom,highest-bank-bit = <16>;
 
@@ -115,29 +75,6 @@
 		qcom,tzone-names = "gpuss-0-usr", "gpuss-1-usr";
 
 		qcom,pm-qos-active-latency = <44>;
-
-		qcom,ca-busy-penalty = <9000>;
-		qcom,enable-midframe-timer;
-		qcom,wakeup-boost-ms = <50>;
-		qcom,wakeup-boost-pwrlevel = <1>;
-
-		interconnects = <&kona_icc KONA_ICC_GPU_TO_LLCC>,
-				<&kona_icc KONA_ICC_GPU_TO_MEM>,
-				<&kona_icc KONA_ICC_CPU_TO_GPU_CFG>;
-		interconnect-names = "gpu-llcc", "gpu-ddr", "cpu-gpu-cfg";
-
-		/*
-		 * ICC GPU BW levels in kB/s. Keep msm_bus tables for fallback until
-		 * all downstream users are fully moved to ICC-only voting.
-		 */
-		qcom,gpu-icc-bw-avg-kbps =
-			<1 292968 440429 622558 760253 946289 1113281
-			 1406250 1968750 2390625 2812500 3515625 4218750 4921875>;
-		qcom,gpu-icc-bw-peak-kbps =
-			<1 1171875 1761718 2490234 3041015 3785156 4453125
-			 5625000 7875000 9562500 11250000 14062500 16875000 19687500>;
-		qcom,gpu-cfg-icc-bw-avg-kbps = <1 25>;
-		qcom,gpu-cfg-icc-bw-peak-kbps = <1 100>;
 
 		clocks = <&clock_gpucc GPU_CC_CXO_CLK>,
 			<&clock_gcc GCC_DDRSS_GPU_AXI_CLK>,
@@ -175,13 +112,11 @@
 		qcom,gpu-bus-table-0 {
 			compatible = "qcom,gpu-bus-table",
 				"qcom,gpu-bus-table-ddr7";
-			interconnects = <&kona_icc KONA_ICC_GPU_TO_MEM>;
-			interconnect-names = "gpu-ddr";
 			qcom,msm-bus,name = "grp3d";
-			qcom,msm-bus,num-cases = <14>;
+			qcom,msm-bus,num-cases = <12>;
 			qcom,msm-bus,num-paths = <1>;
 			qcom,msm-bus,vectors-KBps =
-				<26 512 1 MHZ_TO_KBPS(1, 4)>,    /* index=0  */
+				<26 512 0 MHZ_TO_KBPS(0, 4)>,    /* index=0  */
 				<26 512 0 MHZ_TO_KBPS(200, 4)>,  /* index=1  */
 				<26 512 0 MHZ_TO_KBPS(300, 4)>,  /* index=2  */
 				<26 512 0 MHZ_TO_KBPS(451, 4)>,  /* index=3  */
@@ -192,21 +127,17 @@
 				<26 512 0 MHZ_TO_KBPS(1353, 4)>, /* index=8  */
 				<26 512 0 MHZ_TO_KBPS(1555, 4)>, /* index=9  */
 				<26 512 0 MHZ_TO_KBPS(1804, 4)>, /* index=10 */
-				<26 512 0 MHZ_TO_KBPS(2092, 4)>, /* index=11 */
-				<26 512 0 MHZ_TO_KBPS(3200, 4)>, /* index=12 */
-				<26 512 0 MHZ_TO_KBPS(3600, 4)>; /* index=13 */
+				<26 512 0 MHZ_TO_KBPS(2092, 4)>; /* index=11 */
 		};
 
 		qcom,gpu-bus-table-1 {
 			compatible = "qcom,gpu-bus-table",
 				"qcom,gpu-bus-table-ddr8";
-			interconnects = <&kona_icc KONA_ICC_GPU_TO_MEM>;
-			interconnect-names = "gpu-ddr";
 			qcom,msm-bus,name = "grp3d";
-			qcom,msm-bus,num-cases = <14>;
+			qcom,msm-bus,num-cases = <12>;
 			qcom,msm-bus,num-paths = <1>;
 			qcom,msm-bus,vectors-KBps =
-				<26 512 1 MHZ_TO_KBPS(1, 4)>,    /* index=0  */
+				<26 512 0 MHZ_TO_KBPS(0, 4)>,    /* index=0  */
 				<26 512 0 MHZ_TO_KBPS(200, 4)>,  /* index=1  */
 				<26 512 0 MHZ_TO_KBPS(300, 4)>,  /* index=2  */
 				<26 512 0 MHZ_TO_KBPS(451, 4)>,  /* index=3  */
@@ -217,9 +148,7 @@
 				<26 512 0 MHZ_TO_KBPS(1555, 4)>, /* index=8  */
 				<26 512 0 MHZ_TO_KBPS(1804, 4)>, /* index=9  */
 				<26 512 0 MHZ_TO_KBPS(2092, 4)>, /* index=10 */
-				<26 512 0 MHZ_TO_KBPS(2736, 4)>, /* index=11 */
-				<26 512 0 MHZ_TO_KBPS(3200, 4)>, /* index=12 */
-				<26 512 0 MHZ_TO_KBPS(3600, 4)>; /* index=13 */
+				<26 512 0 MHZ_TO_KBPS(2736, 4)>; /* index=11 */
 		};
 
 		qcom,l3-pwrlevels {
@@ -268,14 +197,13 @@
 			qcom,gpu-mempool@2 {
 				reg = <2>;
 				qcom,mempool-page-size = <65536>;
-				qcom,mempool-reserved = <448>;
-				qcom,mempool-allocate;
+				qcom,mempool-reserved = <256>;
 			};
 			/* 1M Page Pool configuration */
 			qcom,gpu-mempool@3 {
 				reg = <3>;
 				qcom,mempool-page-size = <1048576>;
-				qcom,mempool-reserved = <48>;
+				qcom,mempool-reserved = <32>;
 			};
 		};
 
@@ -288,130 +216,46 @@
 
 			qcom,gpu-pwrlevel@0 {
 				reg = <0>;
-				qcom,gpu-freq = <938000000>;
-				qcom,bus-freq-ddr7 = <13>;
-				qcom,bus-min-ddr7 = <10>;
-				qcom,bus-max-ddr7 = <13>;
+				qcom,gpu-freq = <480000000>;
+				qcom,bus-freq-ddr7 = <11>;
+				qcom,bus-min-ddr7 = <11>;
+				qcom,bus-max-ddr7 = <11>;
 
-				qcom,bus-freq-ddr8 = <13>;
-				qcom,bus-min-ddr8 = <10>;
-				qcom,bus-max-ddr8 = <13>;
+				qcom,bus-freq-ddr8 = <11>;
+				qcom,bus-min-ddr8 = <11>;
+				qcom,bus-max-ddr8 = <11>;
 			};
 
 			qcom,gpu-pwrlevel@1 {
 				reg = <1>;
-				qcom,gpu-freq = <840000000>;
-				qcom,bus-freq-ddr7 = <13>;
-				qcom,bus-min-ddr7 = <10>;
-				qcom,bus-max-ddr7 = <13>;
+				qcom,gpu-freq = <381000000>;
+				qcom,bus-freq-ddr7 = <9>;
+				qcom,bus-min-ddr7 = <7>;
+				qcom,bus-max-ddr7 = <11>;
 
-				qcom,bus-freq-ddr8 = <13>;
-				qcom,bus-min-ddr8 = <10>;
-				qcom,bus-max-ddr8 = <13>;
+				qcom,bus-freq-ddr8 = <8>;
+				qcom,bus-min-ddr8 = <7>;
+				qcom,bus-max-ddr8 = <11>;
 			};
 
 			qcom,gpu-pwrlevel@2 {
 				reg = <2>;
-				qcom,gpu-freq = <760000000>;
-				qcom,bus-freq-ddr7 = <13>;
-				qcom,bus-min-ddr7 = <10>;
-				qcom,bus-max-ddr7 = <13>;
+				qcom,gpu-freq = <290000000>;
+				qcom,bus-freq-ddr7 = <2>;
+				qcom,bus-min-ddr7 = <1>;
+				qcom,bus-max-ddr7 = <9>;
 
-				qcom,bus-freq-ddr8 = <13>;
-				qcom,bus-min-ddr8 = <10>;
-				qcom,bus-max-ddr8 = <13>;
+				qcom,bus-freq-ddr8 = <2>;
+				qcom,bus-min-ddr8 = <1>;
+				qcom,bus-max-ddr8 = <8>;
 			};
 
 			qcom,gpu-pwrlevel@3 {
 				reg = <3>;
-				qcom,gpu-freq = <670000000>;
-				qcom,bus-freq-ddr7 = <13>;
-				qcom,bus-min-ddr7 = <10>;
-				qcom,bus-max-ddr7 = <13>;
-
-				qcom,bus-freq-ddr8 = <13>;
-				qcom,bus-min-ddr8 = <10>;
-				qcom,bus-max-ddr8 = <13>;
-			};
-
-			qcom,gpu-pwrlevel@4 {
-				reg = <4>;
-				qcom,gpu-freq = <587000000>;
-				qcom,bus-freq-ddr7 = <12>;
-				qcom,bus-min-ddr7 = <10>;
-				qcom,bus-max-ddr7 = <13>;
-
-				qcom,bus-freq-ddr8 = <12>;
-				qcom,bus-min-ddr8 = <10>;
-				qcom,bus-max-ddr8 = <13>;
-			};
-
-			qcom,gpu-pwrlevel@5 {
-				reg = <5>;
-				qcom,gpu-freq = <525000000>;
-				qcom,bus-freq-ddr7 = <11>;
-				qcom,bus-min-ddr7 = <9>;
-				qcom,bus-max-ddr7 = <13>;
-
-				qcom,bus-freq-ddr8 = <11>;
-				qcom,bus-min-ddr8 = <9>;
-				qcom,bus-max-ddr8 = <13>;
-			};
-
-			qcom,gpu-pwrlevel@6 {
-				reg = <6>;
-				qcom,gpu-freq = <430000000>;
-				qcom,bus-freq-ddr7 = <10>;
-				qcom,bus-min-ddr7 = <10>;
-				qcom,bus-max-ddr7 = <12>;
-
-				qcom,bus-freq-ddr8 = <10>;
-				qcom,bus-min-ddr8 = <10>;
-				qcom,bus-max-ddr8 = <12>;
-			};
-
-			qcom,gpu-pwrlevel@7 {
-				reg = <7>;
-				qcom,gpu-freq = <360000000>;
-				qcom,bus-freq-ddr7 = <10>;
-				qcom,bus-min-ddr7 = <10>;
-				qcom,bus-max-ddr7 = <12>;
-
-				qcom,bus-freq-ddr8 = <10>;
-				qcom,bus-min-ddr8 = <10>;
-				qcom,bus-max-ddr8 = <12>;
-			};
-
-			qcom,gpu-pwrlevel@8 {
-				reg = <8>;
-				qcom,gpu-freq = <300000000>;
-				qcom,bus-freq-ddr7 = <9>;
-				qcom,bus-min-ddr7 = <8>;
-				qcom,bus-max-ddr7 = <11>;
-
-				qcom,bus-freq-ddr8 = <9>;
-				qcom,bus-min-ddr8 = <8>;
-				qcom,bus-max-ddr8 = <11>;
-			};
-
-			qcom,gpu-pwrlevel@9 {
-				reg = <9>;
-				qcom,gpu-freq = <257000000>;
-				qcom,bus-freq-ddr7 = <8>;
-				qcom,bus-min-ddr7 = <7>;
-				qcom,bus-max-ddr7 = <10>;
-
-				qcom,bus-freq-ddr8 = <8>;
-				qcom,bus-min-ddr8 = <7>;
-				qcom,bus-max-ddr8 = <10>;
-			};
-
-			qcom,gpu-pwrlevel@10 {
-				reg = <10>;
 				qcom,gpu-freq = <0>;
-				qcom,bus-freq = <1>;
-				qcom,bus-min = <1>;
-				qcom,bus-max = <1>;
+				qcom,bus-freq = <0>;
+				qcom,bus-min = <0>;
+				qcom,bus-max = <0>;
 			};
 		};
 	};
@@ -464,14 +308,6 @@
 		interrupts = <0 304 IRQ_TYPE_LEVEL_HIGH>,
 						<0 305 IRQ_TYPE_LEVEL_HIGH>;
 		interrupt-names = "kgsl_hfi_irq", "kgsl_gmu_irq";
-
-		interconnects = <&kona_icc KONA_ICC_GMU_TO_LLCC>,
-				<&kona_icc KONA_ICC_GMU_TO_MEM>;
-		interconnect-names = "gmu-llcc", "gmu-ddr";
-
-		qcom,gmu-freq = <575000000>;
-		qcom,gmu-icc-bw-avg-kbps = <1 292968 585937 878906>;
-		qcom,gmu-icc-bw-peak-kbps = <1 1171875 2343750 3515625>;
 
 		qcom,msm-bus,name = "cnoc";
 		qcom,msm-bus,num-cases = <2>;
