@@ -19,6 +19,7 @@
 #include <linux/kdev_t.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
+#include <linux/list.h>
 #include <linux/math64.h>
 #include <linux/minmax.h>
 #include <linux/overflow.h>
@@ -714,6 +715,23 @@ static struct kona_ipa_shadow_state kona_ipa_shadow = {
 
 struct kona_icc_provider;
 
+/*
+ * Track every acquired ICC path independently.
+ *
+ * Several Kona consumers can reference the same logical provider node.
+ * Caching only the most recent callback makes the last client win and can
+ * erase bandwidth still required by another active client.
+ */
+struct kona_icc_client_vote {
+	struct list_head node;
+	struct kona_icc_provider *qp;
+	unsigned int index;
+	u64 avg_bw;
+	u64 peak_bw;
+	u32 tag;
+	bool valid;
+};
+
 static int kona_icc_commit_ipa_bcms(
 		struct kona_icc_provider *qp,
 		const struct kona_ipa_shadow_row *row);
@@ -1231,16 +1249,21 @@ struct kona_ipa_bcm_shadow {
 #define KONA_AFM_SCORE_MAX		1024U
 #define KONA_AFM_EWMA_SHIFT		3U
 
-#define KONA_AFM_RATIO_MIN_PERMILLE	1250U
-#define KONA_AFM_RATIO_MAX_PERMILLE	2300U
+#define KONA_AFM_RATIO_MIN_PERMILLE	1400U
+#define KONA_AFM_RATIO_MAX_PERMILLE	2800U
 
-#define KONA_AFM_MIN_AB_KB		384000ULL
-#define KONA_AFM_MIN_IB_KB		768000ULL
+/*
+ * Short ACTIVE bursts need enough immediate fabric bandwidth to avoid
+ * starting from deep DDR/LLCC corners. These are burst envelopes, not
+ * permanent floors: true idle still bypasses them and reaches 0/0.
+ */
+#define KONA_AFM_MIN_AB_KB		1024000ULL
+#define KONA_AFM_MIN_IB_KB		4096000ULL
 
-#define KONA_AFM_HOLD_MIN_MS		8U
-#define KONA_AFM_HOLD_MAX_MS		56U
+#define KONA_AFM_HOLD_MIN_MS		10U
+#define KONA_AFM_HOLD_MAX_MS		64U
 
-#define KONA_AFM_AB_UPLIFT_MAX_PERCENT	15U
+#define KONA_AFM_AB_UPLIFT_MAX_PERCENT	20U
 
 struct kona_cpu_afm_state {
 	u64 avg_ewma;
@@ -1296,8 +1319,11 @@ struct kona_icc_provider {
 	struct kona_shadow_bcm_state shadow_bcms[KONA_SHADOW_BCM_COUNT];
 
 	/*
-	 * Stage-5.5 raw-client comparison view. This bypasses Kona's legacy
-	 * floor/hysteresis policy and consumes req_ab/req_ib directly.
+	 * Modern Stage-12 physical BCM view.
+	 *
+	 * The structure originated as the Stage-5.5 raw comparison model.
+	 * ACTIVE now carries policy-aware CPU + shared storage contributions,
+	 * while WAKE/SLEEP retain request-owned low-power semantics.
 	 */
 	struct kona_shadow_raw_bcm_state
 		shadow_raw_bcms[KONA_SHADOW_BCM_COUNT];
@@ -1358,9 +1384,10 @@ struct kona_icc_provider {
 
 
 	/*
-	 * Stage 10/11 RAW candidate transaction state.
+	 * Stage 10/11 transaction state promoted to Stage-12 ownership.
 	 *
-	 * These are separate from the policy-fed Stage-6/8 shadow batches.
+	 * ACTIVE is now the policy-aware production image. WAKE/SLEEP remain
+	 * request-derived unless modern low-power ownership is explicitly armed.
 	 */
 	struct kona_shadow_tcs_batch
 		raw_state_batches[KONA_SHADOW_BUCKET_COUNT];
@@ -1445,6 +1472,13 @@ struct kona_icc_provider {
 	atomic_t votes_paused;
 	/* Serialize logical-path updates that share a physical RPMh BCM. */
 	struct mutex vote_lock;
+
+	/*
+	 * Individual ICC consumers. vote_lock protects this list and all
+	 * client vote fields.
+	 */
+	struct list_head client_votes;
+
 	u64 *last_ab;
 	u64 *last_ib;
 	u64 *req_ab;
@@ -1459,6 +1493,13 @@ struct kona_icc_provider {
 	struct delayed_work resume_floor_work;
 	unsigned long resume_floor_deadline;
 	struct delayed_work cpu_downvote_work;
+
+	/*
+	 * AFM may retain an ACTIVE CPU envelope briefly after demand falls.
+	 * Guarantee that residency expires even when no new ICC callback arrives.
+	 */
+	struct delayed_work cpu_afm_work;
+
 	unsigned long cpu_downvote_deadline;
 	bool cpu_downvote_expired;
 	atomic_t deferred_votes;
@@ -2467,20 +2508,25 @@ static unsigned long kona_dsp_keepalive_ib_kb = 1800000;  /* 1.8 GB/s */
 static bool kona_ipa_keepalive_enable = true;
 static unsigned long kona_ipa_keepalive_ab_kb = 512000;   /* 512 MB/s */
 static unsigned long kona_ipa_keepalive_ib_kb = 8192000;  /* 8 GB/s */
-static unsigned int kona_ipa_keepalive_window_ms = 2000;
+static unsigned int kona_ipa_keepalive_window_ms = 300;
 
 static bool kona_keepalive_decay_enable = true;
 static unsigned int kona_keepalive_decay_window_ms = 750;
 static unsigned int kona_keepalive_decay_min_percent = 25;
-static unsigned int kona_sleep_keepalive_percent = 18;
-static unsigned int kona_sleep_perf_floor_percent = 35;
-static unsigned long kona_sleep_perf_floor_trigger_kb = 2500000; /* 2.5 GB/s */
+/*
+ * Screen-off policy is intentionally much more aggressive than ACTIVE.
+ * Foreground latency is handled by AFM; display-off housekeeping should not
+ * retain a meaningful fraction of those performance envelopes.
+ */
+static unsigned int kona_sleep_keepalive_percent = 0;
+static unsigned int kona_sleep_perf_floor_percent = 15;
+static unsigned long kona_sleep_perf_floor_trigger_kb = 4000000; /* 4 GB/s */
 static bool kona_sleep_floor_decay_enable = true;
-static unsigned int kona_sleep_floor_decay_delay_ms = 30000;
-static unsigned int kona_sleep_floor_decay_percent = 15;
+static unsigned int kona_sleep_floor_decay_delay_ms = 5000;
+static unsigned int kona_sleep_floor_decay_percent = 0;
 module_param_named(kona_sleep_perf_floor_percent, kona_sleep_perf_floor_percent, uint, 0644);
 MODULE_PARM_DESC(kona_sleep_perf_floor_percent,
-	"Percent of performance floors kept for substantial display-inactive requests (default: 35)");
+	"Percent of performance floors kept for substantial display-inactive requests (default: 15)");
 module_param_named(kona_sleep_perf_floor_trigger_kb, kona_sleep_perf_floor_trigger_kb, ulong, 0644);
 MODULE_PARM_DESC(kona_sleep_perf_floor_trigger_kb,
 	"Minimum display-inactive request KB/s before applying scaled performance floors");
@@ -2489,10 +2535,10 @@ MODULE_PARM_DESC(kona_sleep_floor_decay_enable,
 		 "Enable deeper screen-off Kona ICC floor decay after the grace window (default: on)");
 module_param_named(kona_sleep_floor_decay_delay_ms, kona_sleep_floor_decay_delay_ms, uint, 0644);
 MODULE_PARM_DESC(kona_sleep_floor_decay_delay_ms,
-		 "Screen-off grace period in ms before using the decayed ICC floor percent");
+		 "Screen-off grace period in ms before allowing full floor collapse");
 module_param_named(kona_sleep_floor_decay_percent, kona_sleep_floor_decay_percent, uint, 0644);
 MODULE_PARM_DESC(kona_sleep_floor_decay_percent,
-		 "Percent of non-display floors kept after screen-off decay (default: 15)");
+		 "Percent of non-display floors kept after screen-off decay (default: 0)");
 
 /*
  * Keep active scaling enabled, but require a modest request before applying the
@@ -2599,7 +2645,7 @@ MODULE_PARM_DESC(kona_ipa_keepalive_ib_kb,
 	"IPA transition keepalive IB floor in KB/s (default: 8192000)");
 module_param(kona_ipa_keepalive_window_ms, uint, 0644);
 MODULE_PARM_DESC(kona_ipa_keepalive_window_ms,
-	"Maximum IPA transition keepalive window in ms (default: 2000)");
+	"Maximum IPA transition keepalive window in ms (default: 300)");
 
 module_param(kona_keepalive_decay_enable, bool, 0644);
 MODULE_PARM_DESC(kona_keepalive_decay_enable,
@@ -2612,7 +2658,7 @@ MODULE_PARM_DESC(kona_keepalive_decay_min_percent,
 	"minimum keepalive strength percent while inside decay window (default: 25)");
 module_param(kona_sleep_keepalive_percent, uint, 0644);
 MODULE_PARM_DESC(kona_sleep_keepalive_percent,
-	"Percent of keepalive floor retained while display is inactive (default: 18)");
+	"Percent of keepalive floor retained while display is inactive (default: 0)");
 
 module_param(kona_cpu_ib_boost_percent, uint, 0644);
 MODULE_PARM_DESC(kona_cpu_ib_boost_percent,
@@ -4075,11 +4121,72 @@ kona_find_desc(struct kona_icc_provider *qp, u32 id, unsigned int *index)
 	return NULL;
 }
 
+static u32 kona_icc_client_effective_tag(u32 tag)
+{
+	return tag ? tag : KONA_SHADOW_TAG_ALWAYS;
+}
+
+/*
+ * Aggregate all consumers referencing one logical Kona node.
+ *
+ * Average bandwidth is additive and peak bandwidth follows max semantics,
+ * matching the ICC core model. Tags are unioned so ACTIVE/WAKE/SLEEP state
+ * cannot be lost merely because another client happened to update last.
+ *
+ * Caller holds qp->vote_lock.
+ */
+static void kona_icc_aggregate_node_clients(struct kona_icc_provider *qp,
+					    unsigned int index,
+					    u64 *avg_bw, u64 *peak_bw,
+					    u32 *tag)
+{
+	struct kona_icc_client_vote *client;
+	u64 avg = 0;
+	u64 peak = 0;
+	u32 aggregate_tag = 0;
+
+	if (avg_bw)
+		*avg_bw = 0;
+	if (peak_bw)
+		*peak_bw = 0;
+	if (tag)
+		*tag = KONA_SHADOW_TAG_ALWAYS;
+
+	if (!qp || index >= qp->num_nodes)
+		return;
+
+	list_for_each_entry(client, &qp->client_votes, node) {
+		if (!client->valid || client->index != index)
+			continue;
+
+		if (U64_MAX - avg < client->avg_bw)
+			avg = U64_MAX;
+		else
+			avg += client->avg_bw;
+
+		peak = max(peak, client->peak_bw);
+		aggregate_tag |= kona_icc_client_effective_tag(client->tag);
+	}
+
+	if (!aggregate_tag)
+		aggregate_tag = KONA_SHADOW_TAG_ALWAYS;
+
+	if (avg_bw)
+		*avg_bw = avg;
+	if (peak_bw)
+		*peak_bw = peak;
+	if (tag)
+		*tag = aggregate_tag;
+}
+
+static void kona_icc_release(struct icc_path *path);
+
 static struct icc_path *kona_icc_xlate(struct icc_provider *provider,
 				       const struct of_phandle_args *spec)
 {
 	struct kona_icc_provider *qp = dev_get_drvdata(provider->dev);
 	const struct kona_icc_node_desc *desc;
+	struct kona_icc_client_vote *client;
 	struct icc_path *path;
 	unsigned int index = 0;
 
@@ -4124,7 +4231,21 @@ static struct icc_path *kona_icc_xlate(struct icc_provider *provider,
 	if (IS_ERR(path))
 		return path;
 
-	path->data = (void *)(uintptr_t)index;
+	client = kzalloc(sizeof(*client), GFP_KERNEL);
+	if (!client) {
+		kona_icc_release(path);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	client->qp = qp;
+	client->index = index;
+	INIT_LIST_HEAD(&client->node);
+
+	mutex_lock(&qp->vote_lock);
+	list_add_tail(&client->node, &qp->client_votes);
+	mutex_unlock(&qp->vote_lock);
+
+	path->data = client;
 
 	return path;
 }
@@ -4507,79 +4628,205 @@ static void kona_icc_cpu_afm_evaluate(struct kona_icc_provider *qp,
 				      u64 *afm_avg, u64 *afm_peak);
 
 static void
-kona_icc_shadow_raw_cpu_endpoint_vote(struct kona_icc_provider *qp,
-				      bool memory,
-				      enum kona_shadow_bucket_id bucket,
-				      u64 *avg, u64 *peak,
-				      u64 *activity)
+kona_icc_shadow_cpu_endpoint_vote(struct kona_icc_provider *qp,
+				  bool memory,
+				  enum kona_shadow_bucket_id bucket,
+				  u64 *avg, u64 *peak,
+				  u64 *activity)
 {
-	u64 generic_avg = 0;
-	u64 per_cpu_avg = 0;
-	u64 endpoint_peak = 0;
+	u64 generic_raw_avg = 0;
+	u64 generic_eff_avg = 0;
+	u64 per_cpu_raw_avg = 0;
+	u64 per_cpu_eff_avg = 0;
+	u64 raw_peak = 0;
+	u64 policy_peak = 0;
 	unsigned int i;
+	bool active_bucket;
 
 	*avg = 0;
 	*peak = 0;
 	*activity = 0;
 
 	if (!qp || !qp->req_ab || !qp->req_ib ||
+	    !qp->eff_ab || !qp->eff_ib ||
 	    bucket >= KONA_SHADOW_BUCKET_COUNT)
 		return;
 
+	active_bucket = bucket == KONA_SHADOW_BUCKET_AMC;
+
 	for (i = 0; i < qp->num_nodes; i++) {
 		const struct kona_icc_node_desc *node = &qp->nodes[i];
-		u64 raw_avg, raw_peak;
+		u64 node_raw_avg;
+		u64 node_raw_peak;
+		u64 node_eff_avg;
+		u64 node_eff_peak;
 		u32 tag;
 
 		if (!kona_icc_is_cpu_memory_path(node) ||
 		    kona_icc_cpu_to_memory(node->id) != memory)
 			continue;
 
-		if (kona_icc_is_policy_suppressed_path(node) ||
-		    kona_icc_is_external_cached_path(node))
+		/*
+		 * ACTIVE owns the physical CPU fabric and must see every valid
+		 * CPU endpoint request, matching kona_icc_cpu_endpoint_vote().
+		 *
+		 * Retain suppression for low-power bucket construction only.
+		 */
+		if (!active_bucket &&
+		    (kona_icc_is_policy_suppressed_path(node) ||
+		     kona_icc_is_external_cached_path(node)))
 			continue;
 
 		tag = kona_icc_shadow_effective_tag(qp, i);
 		if (!(tag & BIT(bucket)))
 			continue;
 
-		raw_avg = qp->req_ab[i];
-		raw_peak = qp->req_ib[i];
+		node_raw_avg = qp->req_ab[i];
+		node_raw_peak = qp->req_ib[i];
+		node_eff_avg = qp->eff_ab[i];
+		node_eff_peak = qp->eff_ib[i];
 
-		if (raw_avg == U64_MAX || raw_peak == U64_MAX)
+		if (node_raw_avg == U64_MAX ||
+		    node_raw_peak == U64_MAX)
 			continue;
 
-		/*
-		 * Generic CPU-to-{LLCC,MEM} requests and the per-CPU requests are
-		 * overlapping views of the same physical endpoint.  Do not add the
-		 * generic request to the per-CPU aggregate.
-		 *
-		 * Individual CPU AB requests represent independent sustained
-		 * contributors and therefore accumulate.  Peak bandwidth remains
-		 * a max aggregate, matching ICC peak semantics.
-		 */
-		if (kona_icc_cpu_generic(node->id))
-			generic_avg = max(generic_avg, raw_avg);
-		else
-			kona_icc_add_cpu_ab(&per_cpu_avg, raw_avg);
+		if (kona_icc_cpu_generic(node->id)) {
+			generic_raw_avg =
+				max(generic_raw_avg, node_raw_avg);
 
-		endpoint_peak = max(endpoint_peak, raw_peak);
+			if (active_bucket && node_eff_avg != U64_MAX)
+				generic_eff_avg =
+					max(generic_eff_avg, node_eff_avg);
+		} else {
+			kona_icc_add_cpu_ab(&per_cpu_raw_avg,
+					    node_raw_avg);
+
+			if (active_bucket && node_eff_avg != U64_MAX)
+				per_cpu_eff_avg =
+					max(per_cpu_eff_avg,
+					    node_eff_avg);
+		}
+
+		raw_peak = max(raw_peak, node_raw_peak);
+
+		if (active_bucket && node_eff_peak != U64_MAX)
+			policy_peak =
+				max(policy_peak, node_eff_peak);
 	}
 
-	*avg = max(generic_avg, per_cpu_avg);
-	*peak = endpoint_peak;
-	*activity = endpoint_peak;
+	if (active_bucket) {
+		*avg = max(max(generic_raw_avg, generic_eff_avg),
+			   max(per_cpu_raw_avg, per_cpu_eff_avg));
+		*peak = max(raw_peak, policy_peak);
+	} else {
+		*avg = max(generic_raw_avg, per_cpu_raw_avg);
+		*peak = raw_peak;
+	}
+
+	*activity = raw_peak;
+}
+
+
+/*
+ * Fold externally-owned storage activity into the shared modern fabric
+ * owner without creating a second RPMh writer.
+ *
+ * ufs-qcom/sdhci-msm retain ownership of their dedicated physical paths.
+ * This provider owns the shared SH0/MC0 CPU fabric transaction. Storage
+ * therefore contributes only to those shared downstream BCMs.
+ */
+static void
+kona_icc_shadow_storage_contribution(struct kona_icc_provider *qp,
+				     enum kona_shadow_bucket_id bucket,
+				     u64 *llcc_avg, u64 *llcc_peak,
+				     u64 *mem_avg, u64 *mem_peak)
+{
+	bool assist = false;
+	unsigned int i;
+
+	*llcc_avg = 0;
+	*llcc_peak = 0;
+	*mem_avg = 0;
+	*mem_peak = 0;
+
+	if (!qp || !qp->req_ab || !qp->req_ib ||
+	    !qp->eff_ab || !qp->eff_ib)
+		return;
+
+	if (READ_ONCE(kona_storage_raw_icc_enable))
+		return;
+
+	if (bucket != KONA_SHADOW_BUCKET_AMC)
+		return;
+
+	for (i = 0; i < qp->num_nodes; i++) {
+		const struct kona_icc_node_desc *node = &qp->nodes[i];
+		u64 raw_ab, raw_ib;
+		u64 eff_ab, eff_ib;
+		u32 tag;
+
+		if (!kona_icc_is_storage_path(node))
+			continue;
+
+		tag = kona_icc_shadow_effective_tag(qp, i);
+		if (!(tag & BIT(bucket)))
+			continue;
+
+		raw_ab = qp->req_ab[i];
+		raw_ib = qp->req_ib[i];
+		eff_ab = qp->eff_ab[i];
+		eff_ib = qp->eff_ib[i];
+
+		if (raw_ab == U64_MAX || raw_ib == U64_MAX)
+			continue;
+
+		if (max(raw_ab, raw_ib) >=
+		    KONA_STORAGE_ASSIST_TRIGGER_KB)
+			assist = true;
+
+		switch (node->id) {
+		case KONA_ICC_UFS_TO_MEM:
+		case KONA_ICC_SDHC2_TO_MEM:
+			if (eff_ab != U64_MAX)
+				*mem_avg = max(*mem_avg, eff_ab);
+			if (eff_ib != U64_MAX)
+				*mem_peak = max(*mem_peak, eff_ib);
+			break;
+
+		case KONA_ICC_UFS_TO_LLCC:
+			if (eff_ab != U64_MAX)
+				*llcc_avg = max(*llcc_avg, eff_ab);
+			if (eff_ib != U64_MAX)
+				*llcc_peak = max(*llcc_peak, eff_ib);
+			break;
+
+		default:
+			break;
+		}
+	}
+
+	if (assist) {
+		*mem_avg = max_t(u64, *mem_avg,
+				 KONA_STORAGE_ASSIST_DDR_AB_FLOOR_KB);
+		*mem_peak = max_t(u64, *mem_peak,
+				  KONA_STORAGE_ASSIST_DDR_IB_FLOOR_KB);
+
+		*llcc_avg = max_t(u64, *llcc_avg,
+				  KONA_STORAGE_ASSIST_LLCC_AB_FLOOR_KB);
+		*llcc_peak = max_t(u64, *llcc_peak,
+				   KONA_STORAGE_ASSIST_LLCC_IB_FLOOR_KB);
+	}
 }
 
 /*
- * Stage-5.5 raw-client aggregate.
+ * Stage-5.5 raw-client diagnostic aggregate.
  *
  * This deliberately consumes req_ab/req_ib instead of eff_ab/eff_ib so
- * we can compare modern BCM behavior before and after Kona's legacy
- * policy transformations.
+ * diagnostics can compare raw client demand against Stage-12 production
+ * policy. It no longer defines the authoritative ACTIVE CPU hardware vote.
  *
- * Keep the compatibility max() semantics and ownership exclusions, but
- * do not apply storage assist or other effective-vote policy here.
+ * Keep compatibility max() semantics and ownership exclusions here; the
+ * production Stage-12 path performs policy-aware endpoint aggregation.
  */
 static u64
 kona_icc_shadow_raw_bucket_resource_vote(struct kona_icc_provider *qp,
@@ -4924,57 +5171,93 @@ static void kona_icc_refresh_raw_shadow_buckets(struct kona_icc_provider *qp)
 		return;
 
 	for (bucket = 0; bucket < KONA_SHADOW_BUCKET_COUNT; bucket++) {
-		u64 llcc_avg, llcc_peak, llcc_activity;
-		u64 mem_avg, mem_peak, mem_activity;
-		u64 fabric_avg, fabric_peak;
+		u64 cpu_llcc_avg, cpu_llcc_peak, llcc_activity;
+		u64 cpu_mem_avg, cpu_mem_peak, mem_activity;
+		u64 cpu_fabric_avg, cpu_fabric_peak;
+		u64 storage_llcc_avg, storage_llcc_peak;
+		u64 storage_mem_avg, storage_mem_peak;
+		u64 sh0_avg, sh0_peak;
+		u64 mc0_avg, mc0_peak;
 		u64 activity;
 
-		/*
-		 * Aggregate the physical CPU endpoints correctly before BCM
-		 * encoding. Per-CPU AB is additive, generic aliases overlap, and
-		 * peak demand remains a max.
-		 */
-		kona_icc_shadow_raw_cpu_endpoint_vote(qp, false, bucket,
-						     &llcc_avg, &llcc_peak,
-						     &llcc_activity);
-		kona_icc_shadow_raw_cpu_endpoint_vote(qp, true, bucket,
-						     &mem_avg, &mem_peak,
-						     &mem_activity);
+		kona_icc_shadow_cpu_endpoint_vote(qp, false, bucket,
+						 &cpu_llcc_avg,
+						 &cpu_llcc_peak,
+						 &llcc_activity);
 
-		fabric_avg = max(llcc_avg, mem_avg);
-		fabric_peak = max(llcc_peak, mem_peak);
+		kona_icc_shadow_cpu_endpoint_vote(qp, true, bucket,
+						 &cpu_mem_avg,
+						 &cpu_mem_peak,
+						 &mem_activity);
+
+		cpu_fabric_avg = max(cpu_llcc_avg, cpu_mem_avg);
+		cpu_fabric_peak = max(cpu_llcc_peak, cpu_mem_peak);
+
 		activity = max(llcc_activity, mem_activity);
 
-		/*
-		 * Stage-1 AFM observation belongs here: after real CPU endpoint
-		 * aggregation and before SH4/SH0/MC0 encoding.  Restrict learning
-		 * to ACTIVE/AMC so WAKE/SLEEP tags cannot pollute workload history.
-		 *
-		 * AFM remains telemetry-only for this stage.
-		 */
-		if (bucket == KONA_SHADOW_BUCKET_AMC) {
+		if (bucket == KONA_SHADOW_BUCKET_AMC &&
+		    (cpu_fabric_avg || cpu_fabric_peak)) {
 			u64 afm_avg, afm_peak;
 
 			kona_icc_cpu_afm_evaluate(qp,
-						  fabric_avg, fabric_peak,
+						  cpu_fabric_avg,
+						  cpu_fabric_peak,
 						  activity,
+						  &afm_avg,
+						  &afm_peak);
+
+			cpu_fabric_avg =
+				max(cpu_fabric_avg, afm_avg);
+			cpu_fabric_peak =
+				max(cpu_fabric_peak, afm_peak);
+
+			if (cpu_mem_avg || cpu_mem_peak) {
+				cpu_mem_avg =
+					max(cpu_mem_avg, afm_avg);
+				cpu_mem_peak =
+					max(cpu_mem_peak, afm_peak);
+			}
+		} else if (bucket == KONA_SHADOW_BUCKET_AMC) {
+			u64 afm_avg, afm_peak;
+
+			kona_icc_cpu_afm_evaluate(qp, 0, 0, 0,
 						  &afm_avg, &afm_peak);
+
+			if (afm_avg || afm_peak) {
+				cpu_fabric_avg =
+					max(cpu_fabric_avg, afm_avg);
+				cpu_fabric_peak =
+					max(cpu_fabric_peak, afm_peak);
+			}
 		}
 
+		kona_icc_shadow_storage_contribution(
+			qp, bucket,
+			&storage_llcc_avg, &storage_llcc_peak,
+			&storage_mem_avg, &storage_mem_peak);
+
 		qp->shadow_raw_bcms[KONA_SHADOW_BCM_SH4]
-			.bucket_avg[bucket] = fabric_avg;
+			.bucket_avg[bucket] = cpu_fabric_avg;
 		qp->shadow_raw_bcms[KONA_SHADOW_BCM_SH4]
-			.bucket_peak[bucket] = fabric_peak;
+			.bucket_peak[bucket] = cpu_fabric_peak;
+
+		sh0_avg = cpu_fabric_avg;
+		kona_icc_add_cpu_ab(&sh0_avg, storage_llcc_avg);
+		sh0_peak = max(cpu_fabric_peak, storage_llcc_peak);
+
+		mc0_avg = cpu_mem_avg;
+		kona_icc_add_cpu_ab(&mc0_avg, storage_mem_avg);
+		mc0_peak = max(cpu_mem_peak, storage_mem_peak);
 
 		qp->shadow_raw_bcms[KONA_SHADOW_BCM_SH0]
-			.bucket_avg[bucket] = fabric_avg;
+			.bucket_avg[bucket] = sh0_avg;
 		qp->shadow_raw_bcms[KONA_SHADOW_BCM_SH0]
-			.bucket_peak[bucket] = fabric_peak;
+			.bucket_peak[bucket] = sh0_peak;
 
 		qp->shadow_raw_bcms[KONA_SHADOW_BCM_MC0]
-			.bucket_avg[bucket] = mem_avg;
+			.bucket_avg[bucket] = mc0_avg;
 		qp->shadow_raw_bcms[KONA_SHADOW_BCM_MC0]
-			.bucket_peak[bucket] = mem_peak;
+			.bucket_peak[bucket] = mc0_peak;
 
 		kona_icc_shadow_encode_raw_bucket(
 			qp, KONA_SHADOW_BCM_SH4,
@@ -6396,6 +6679,8 @@ static void kona_icc_cpu_afm_evaluate(struct kona_icc_provider *qp,
 		state->held_peak = target_peak;
 		state->hold_until =
 			jiffies + msecs_to_jiffies(hold_ms);
+		mod_delayed_work(system_wq, &qp->cpu_afm_work,
+				 msecs_to_jiffies(hold_ms));
 	} else if (time_after_eq(jiffies, state->hold_until)) {
 		/*
 		 * The previous residency window has expired. Replace stale held
@@ -6405,6 +6690,8 @@ static void kona_icc_cpu_afm_evaluate(struct kona_icc_provider *qp,
 		state->held_peak = target_peak;
 		state->hold_until =
 			jiffies + msecs_to_jiffies(hold_ms);
+		mod_delayed_work(system_wq, &qp->cpu_afm_work,
+				 msecs_to_jiffies(hold_ms));
 	} else if (target_avg > state->held_avg ||
 		   target_peak > state->held_peak) {
 		/*
@@ -6415,6 +6702,8 @@ static void kona_icc_cpu_afm_evaluate(struct kona_icc_provider *qp,
 		state->held_peak = max(state->held_peak, target_peak);
 		state->hold_until =
 			jiffies + msecs_to_jiffies(hold_ms);
+		mod_delayed_work(system_wq, &qp->cpu_afm_work,
+				 msecs_to_jiffies(hold_ms));
 	}
 
 	state->avg_ewma = kona_afm_ewma(state->avg_ewma, raw_avg);
@@ -7983,6 +8272,25 @@ static void kona_icc_cpu_downvote_workfn(struct work_struct *work)
 	kona_icc_queue_replay(qp, 0, "cpu-downvote-hold-expired");
 }
 
+static void kona_icc_cpu_afm_workfn(struct work_struct *work)
+{
+	struct kona_icc_provider *qp =
+		container_of(to_delayed_work(work), struct kona_icc_provider,
+			     cpu_afm_work);
+
+	if (READ_ONCE(qp->system_suspended) ||
+	    atomic_read(&qp->votes_paused))
+		return;
+
+	mutex_lock(&qp->vote_lock);
+
+	if (!READ_ONCE(qp->system_suspended) &&
+	    !atomic_read(&qp->votes_paused))
+		kona_icc_refresh_bcm_shadow(qp);
+
+	mutex_unlock(&qp->vote_lock);
+}
+
 static void kona_icc_resume_floor_workfn(struct work_struct *work)
 {
 	struct kona_icc_provider *qp =
@@ -8092,12 +8400,16 @@ static void kona_icc_validate_vote(struct kona_icc_provider *qp,
 static int __kona_icc_set(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 {
 	struct kona_icc_provider *qp;
+	struct kona_icc_client_vote *client;
 	const struct kona_icc_node_desc *desc;
 	u64 prev_req_ab = U64_MAX, prev_req_ib = U64_MAX;
 	u64 prev_eff_ab = U64_MAX, prev_eff_ib = U64_MAX;
-	u64 ab = (u64)avg_bw;
-	u64 ib = (u64)peak_bw;
+	u64 raw_ab;
+	u64 raw_ib;
+	u64 ab;
+	u64 ib;
 	unsigned int index;
+	u32 aggregate_tag;
 
 	if (IS_ERR_OR_NULL(path) || !path->provider)
 		return -EINVAL;
@@ -8106,9 +8418,32 @@ static int __kona_icc_set(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 	if (!qp)
 		return -EINVAL;
 
-	index = (unsigned int)(uintptr_t)path->data;
+	client = path->data;
+	if (!client || client->qp != qp)
+		return -EINVAL;
+
+	index = client->index;
 	if (index >= qp->num_nodes)
 		return -EINVAL;
+
+	/*
+	 * vote_lock is held by kona_icc_set(). Update this caller first, then
+	 * rebuild the full logical-node requirement before applying policy.
+	 */
+	client->avg_bw = (u64)avg_bw;
+	client->peak_bw = (u64)peak_bw;
+	client->tag = path->tag;
+	client->valid = true;
+
+	kona_icc_aggregate_node_clients(qp, index,
+					&raw_ab, &raw_ib,
+					&aggregate_tag);
+
+	raw_ab = min_t(u64, raw_ab, KONA_ICC_MAX_LOGICAL_VOTE);
+	raw_ib = min_t(u64, raw_ib, KONA_ICC_MAX_LOGICAL_VOTE);
+
+	ab = raw_ab;
+	ib = raw_ib;
 
 	desc = &qp->nodes[index];
 	if (kona_icc_is_cpu_memory_path(desc))
@@ -8124,8 +8459,8 @@ static int __kona_icc_set(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 	if (kona_vote_debug && kona_icc_is_cpu_memory_path(desc))
 		dev_info(qp->provider.dev,
 			 "kona-vote: id=%u raw=%u/%u initial=%llu/%llu base=%llu/%llu\n",
-			 desc->id, avg_bw, peak_bw, (unsigned long long)ab,
-			 (unsigned long long)ib, (unsigned long long)ab,
+			 desc->id, avg_bw, peak_bw, (unsigned long long)raw_ab,
+			 (unsigned long long)raw_ib, (unsigned long long)ab,
 			 (unsigned long long)ib);
 
 #ifdef CONFIG_INTERCONNECT_QCOM_KONA_PERF_FLOOR
@@ -8144,7 +8479,7 @@ static int __kona_icc_set(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 	KONA_VOTE_TRACE(qp, desc, "before-floor", ab, ib);
 	if ((ab || ib) && kona_perf_floor_enable && kona_icc_stage >= 4 &&
 	    !kona_icc_is_policy_suppressed_path(desc)) {
-		kona_icc_apply_floor(qp, desc, avg_bw, peak_bw, &ab, &ib);
+		kona_icc_apply_floor(qp, desc, raw_ab, raw_ib, &ab, &ib);
 	}
 	KONA_VOTE_TRACE(qp, desc, "after-floor", ab, ib);
 	KONA_VOTE_TRACE(qp, desc, "before-hysteresis", ab, ib);
@@ -8187,7 +8522,7 @@ skip_perf_floor:
 	
 	/* Validate the final transformed value before cache, replay, or submission. */
 	KONA_VOTE_TRACE(qp, desc, "before-validator", ab, ib);
-	kona_icc_validate_vote(qp, desc, (u64)avg_bw, (u64)peak_bw, &ab, &ib);
+	kona_icc_validate_vote(qp, desc, raw_ab, raw_ib, &ab, &ib);
 	KONA_VOTE_TRACE(qp, desc, "after-validator", ab, ib);
 	KONA_VOTE_TRACE(qp, desc, "before-cache", ab, ib);
 	if (kona_vote_debug && kona_icc_is_cpu_memory_path(desc))
@@ -8211,15 +8546,15 @@ skip_perf_floor:
 	if (qp->eff_ib)
 		prev_eff_ib = qp->eff_ib[index];
 	if (qp->req_ab)
-		qp->req_ab[index] = (u64)avg_bw;
+		qp->req_ab[index] = raw_ab;
 	if (qp->req_ib)
-		qp->req_ib[index] = (u64)peak_bw;
+		qp->req_ib[index] = raw_ib;
 	if (qp->eff_ab)
 		qp->eff_ab[index] = ab;
 	if (qp->eff_ib)
 		qp->eff_ib[index] = ib;
 	if (qp->shadow_tags)
-		WRITE_ONCE(qp->shadow_tags[index], path->tag);
+		WRITE_ONCE(qp->shadow_tags[index], aggregate_tag);
 	if (WARN_ON_ONCE(!qp->eff_ab || !qp->eff_ib ||
 			 qp->eff_ab[index] != ab || qp->eff_ib[index] != ib))
 		return -EIO;
@@ -8237,14 +8572,16 @@ skip_perf_floor:
 		qp->first_cpu_request_seen = true;
 		dev_err(qp->provider.dev,
 			"kona-rpmh: first CPU request id=%u name=%s raw=%u/%u policy=%llu/%llu stage=%u\n",
-			desc->id, desc->name, avg_bw, peak_bw,
+			desc->id, desc->name,
+			(unsigned int)min_t(u64, raw_ab, U32_MAX),
+			(unsigned int)min_t(u64, raw_ib, U32_MAX),
 			(unsigned long long)ab, (unsigned long long)ib,
 			kona_cpu_model_stage());
 	}
-	if (prev_req_ab != avg_bw || prev_req_ib != peak_bw ||
+	if (prev_req_ab != raw_ab || prev_req_ib != raw_ib ||
 	    prev_eff_ab != ab || prev_eff_ib != ib)
 		kona_icc_mark_dirty(qp, index);
-	if (qp->last_active_jiffies && (avg_bw || peak_bw))
+	if (qp->last_active_jiffies && (raw_ab || raw_ib))
 		qp->last_active_jiffies[index] = jiffies;
 
 	/*
@@ -9488,6 +9825,26 @@ err_unregister:
 
 static void kona_icc_release(struct icc_path *path)
 {
+	struct kona_icc_client_vote *client;
+
+	if (!path)
+		return;
+
+	client = path->data;
+	if (client) {
+		struct kona_icc_provider *qp = client->qp;
+
+		if (qp) {
+			mutex_lock(&qp->vote_lock);
+			if (!list_empty(&client->node))
+				list_del_init(&client->node);
+			mutex_unlock(&qp->vote_lock);
+		}
+
+		kfree(client);
+		path->data = NULL;
+	}
+
 	kfree(path);
 }
 
@@ -9598,10 +9955,24 @@ static int kona_icc_suspend(struct device *dev)
 	/* Drain replay producers before retry cancellation. */
 	cancel_delayed_work_sync(&qp->resume_floor_work);
 	cancel_delayed_work_sync(&qp->cpu_downvote_work);
+	cancel_delayed_work_sync(&qp->cpu_afm_work);
+
 	mutex_lock(&qp->vote_lock);
 	qp->resume_floor_deadline = 0;
 	qp->cpu_downvote_deadline = 0;
 	qp->cpu_downvote_expired = false;
+
+	/*
+	 * ACTIVE burst state must never survive across suspend.
+	 */
+	qp->cpu_afm.held_avg = 0;
+	qp->cpu_afm.held_peak = 0;
+	qp->cpu_afm.proposed_avg = 0;
+	qp->cpu_afm.proposed_peak = 0;
+	qp->cpu_afm.last_avg = 0;
+	qp->cpu_afm.last_peak = 0;
+	qp->cpu_afm.last_activity = 0;
+	qp->cpu_afm.hold_until = 0;
 	mutex_unlock(&qp->vote_lock);
 	/* Ensure no stale vote replays fire during suspend/idle windows. */
 	cancel_delayed_work_sync(&qp->retry_work);
@@ -9842,6 +10213,7 @@ static int kona_icc_probe(struct platform_device *pdev)
 
 	spin_lock_init(&qp->dirty_lock);
 	mutex_init(&qp->vote_lock);
+	INIT_LIST_HEAD(&qp->client_votes);
 
 
 	INIT_DELAYED_WORK(&qp->retry_work, kona_icc_retry_workfn);
@@ -9849,6 +10221,8 @@ static int kona_icc_probe(struct platform_device *pdev)
 			  kona_icc_resume_floor_workfn);
 	INIT_DELAYED_WORK(&qp->cpu_downvote_work,
 			  kona_icc_cpu_downvote_workfn);
+	INIT_DELAYED_WORK(&qp->cpu_afm_work,
+			  kona_icc_cpu_afm_workfn);
 	/* Use phased replay only after resume(); steady-state retries stay immediate. */
 	qp->resume_phase = 3;
 	atomic_set(&qp->deferred_votes, 0);
@@ -10070,6 +10444,7 @@ err_free_bitmaps:
 static int kona_icc_remove(struct platform_device *pdev)
 {
 	struct kona_icc_provider *qp = platform_get_drvdata(pdev);
+	struct kona_icc_client_vote *client, *tmp;
 
 	if (READ_ONCE(kona_ipa_provider) == qp)
 		WRITE_ONCE(kona_ipa_provider, NULL);
@@ -10081,7 +10456,19 @@ static int kona_icc_remove(struct platform_device *pdev)
 
 	cancel_delayed_work_sync(&qp->resume_floor_work);
 	cancel_delayed_work_sync(&qp->cpu_downvote_work);
+	cancel_delayed_work_sync(&qp->cpu_afm_work);
 	cancel_delayed_work_sync(&qp->retry_work);
+
+	/*
+	 * Provider removal normally follows ICC path release, but make teardown
+	 * robust against any remaining acquired clients.
+	 */
+	mutex_lock(&qp->vote_lock);
+	list_for_each_entry_safe(client, tmp, &qp->client_votes, node) {
+		list_del_init(&client->node);
+		client->qp = NULL;
+	}
+	mutex_unlock(&qp->vote_lock);
 
 	if (qp->display_nb_registered) {
 		msm_drm_unregister_client(&qp->display_nb);
