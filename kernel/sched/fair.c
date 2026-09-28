@@ -97,7 +97,7 @@ unsigned int sysctl_sched_cstate_aware = 1;
  */
 unsigned int sysctl_sched_uclass_idle_bias = 0;
 unsigned int sysctl_sched_uclass_wakeup_boost = 1;
-unsigned int sysctl_sched_uclass_prefer_prev_cpu = 1;
+unsigned int sysctl_sched_uclass_prefer_prev_cpu = 0;
 unsigned int sysctl_sched_uclass_gran_boost_pct = 35;
 unsigned int sysctl_sched_uclass_prev_cpu_energy_margin_pct = 10;
 unsigned int sysctl_sched_uclass_auto_tune = 1;
@@ -8065,19 +8065,17 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu,
 	if (p->state == TASK_WAKING)
 		delta = task_util(p);
 #endif
+
 	if (task_placement_boost_enabled(p) || fbt_env.need_idle || boosted ||
 	    is_rtg ||
 	    !task_fits_max(p, prev_cpu) || cpu_isolated(prev_cpu)) {
-		if (cpumask_test_cpu(prev_cpu, candidates) &&
-		    !cpu_isolated(prev_cpu) &&
-		    !__cpu_overutilized(prev_cpu, delta) &&
-		    task_fits_max(p, prev_cpu))
-			best_energy_cpu = prev_cpu;
-		else if (task_placement_boost_enabled(p) || fbt_env.need_idle ||
-			 boosted || is_rtg) {
-			best_energy_cpu = cpu;
-			goto unlock;
-		}
+		/*
+		 * This path already indicates that the previous CPU is no longer
+		 * the preferred placement target.  Keep the selected candidate
+		 * instead of pulling the task back onto a lower-capacity CPU.
+		 */
+		best_energy_cpu = cpu;
+		goto unlock;
 	}
 
 	if (cpumask_test_cpu(prev_cpu, &p->cpus_allowed))

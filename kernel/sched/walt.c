@@ -2688,7 +2688,7 @@ unsigned int __read_mostly sched_group_upmigrate = 20000000;
  * Promote thread groups before a cluster is completely saturated so
  * heterogenous systems can ramp into bigger clusters with less wakeup lag.
  */
-unsigned int __read_mostly sysctl_sched_group_upmigrate_pct = 95;
+unsigned int __read_mostly sysctl_sched_group_upmigrate_pct = 85;
 
 /*
  * Task groups, once up-migrated, will need to drop their aggregate
@@ -2700,7 +2700,7 @@ unsigned int __read_mostly sched_group_downmigrate = 19000000;
  * Keep a small hysteresis band to avoid ping-pong while still allowing
  * groups to return to efficient clusters once sustained demand drops.
  */
-unsigned int __read_mostly sysctl_sched_group_downmigrate_pct = 90;
+unsigned int __read_mostly sysctl_sched_group_downmigrate_pct = 75;
 
 static inline
 void update_best_cluster(struct related_thread_group *grp,
