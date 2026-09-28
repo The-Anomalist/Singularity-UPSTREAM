@@ -1021,10 +1021,16 @@ static int adreno_of_parse_pwrlevels(struct adreno_device *adreno_dev,
 	struct device_node *child;
 	int ret;
 
+	/* Select the OPP table for the fused GPU speed bin. */
+	pwr->opp_table_index = 0;
+	of_property_read_u32(node, "qcom,opp-table-index",
+		&pwr->opp_table_index);
+
 	/* ADD the GPU OPP table if we define it */
 	if (of_find_property(device->pdev->dev.of_node,
 			"operating-points-v2", NULL)) {
-		ret = dev_pm_opp_of_add_table(&device->pdev->dev);
+		ret = dev_pm_opp_of_add_table_indexed(&device->pdev->dev,
+			pwr->opp_table_index);
 		if (ret) {
 			dev_err(device->dev,
 				"Unable to set the GPU OPP table: %d\n", ret);

@@ -813,6 +813,10 @@ static int rpmh_gmu_arc_votes_init(struct gmu_device *gmu,
 	/* Hardcoded values of GMU CX voltage levels */
 	u16 gmu_cx_vlvl[] = { 0, RPMH_REGULATOR_LEVEL_MIN_SVS };
 
+	/* Match the experimental GPUCC CX corner above 500 MHz. */
+	if (gmu->freq > 500000000)
+		gmu_cx_vlvl[1] = RPMH_REGULATOR_LEVEL_NOM;
+
 	return setup_volt_dependency_tbl(gmu->rpmh_votes.cx_votes, pri_rail,
 						sec_rail, gmu_cx_vlvl, 2);
 }
@@ -1634,10 +1638,11 @@ static int gmu_clocks_probe(struct gmu_device *gmu, struct device_node *node)
 	return 0;
 }
 
-static void gmu_read_dt_tunables(struct gmu_device *gmu)
+static int gmu_read_dt_tunables(struct gmu_device *gmu)
 {
 	struct device *dev = &gmu->pdev->dev;
-	u32 freq;
+	u32 freq = 0;
+	long rounded;
 
 	gmu->freq = GMU_FREQUENCY;
 	if (!of_property_read_u32(dev->of_node, "qcom,gmu-freq", &freq) &&
@@ -1645,6 +1650,21 @@ static void gmu_read_dt_tunables(struct gmu_device *gmu)
 		gmu->freq = freq;
 	else if (freq)
 		dev_warn(dev, "Ignoring invalid qcom,gmu-freq=%u\n", freq);
+
+	if (IS_ERR_OR_NULL(gmu->clks[0]))
+		return -EINVAL;
+
+	/* Resolve the rate before building firmware CX frequency votes. */
+	rounded = clk_round_rate(gmu->clks[0], gmu->freq);
+	if (rounded < 0)
+		return (int)rounded;
+	if (rounded < 200000000 || rounded > 600000000)
+		return -EINVAL;
+
+	dev_info(dev, "GMU clock: requested %u Hz, selected %ld Hz\n",
+		gmu->freq, rounded);
+	gmu->freq = (u32)rounded;
+	return 0;
 }
 
 static int gmu_gpu_bw_probe(struct kgsl_device *device, struct gmu_device *gmu)
@@ -1929,6 +1949,21 @@ static void gmu_acd_probe(struct kgsl_device *device, struct gmu_device *gmu,
 	if (!ADRENO_FEATURE(ADRENO_DEVICE(device), ADRENO_ACD))
 		return;
 
+	/* Reject oversized ACD data before writing the fixed HFI payload. */
+	for (i = 0, cmd_idx = 0; i < numlvl; i++)
+		if (pwr->pwrlevels[i].acd_level)
+			cmd_idx++;
+
+	if (cmd_idx > ARRAY_SIZE(cmd->data)) {
+		memset(cmd, 0, sizeof(*cmd));
+		clear_bit(ADRENO_ACD_CTRL,
+			&ADRENO_DEVICE(device)->pwrctrl_flag);
+		dev_warn(&gmu->pdev->dev,
+			"ACD disabled: %u entries exceed HFI capacity %zu\n",
+			cmd_idx, ARRAY_SIZE(cmd->data));
+		return;
+	}
+
 	cmd->hdr = 0xFFFFFFFF;
 	cmd->version = HFI_ACD_INIT_VERSION;
 	cmd->stride = 1;
@@ -2042,7 +2077,9 @@ static int gmu_probe(struct kgsl_device *device, struct device_node *node)
 	}
 
 	/* Initializes GPU b/w levels configuration */
-	gmu_read_dt_tunables(gmu);
+	ret = gmu_read_dt_tunables(gmu);
+	if (ret)
+		goto error;
 
 	ret = gmu_gpu_bw_probe(device, gmu);
 	if (ret)
@@ -2107,6 +2144,10 @@ static int gmu_enable_clks(struct kgsl_device *device)
 		}
 		j++;
 	}
+
+	dev_info_once(&gmu->pdev->dev,
+		"GMU clock after enable: CCF %lu Hz, firmware %u Hz\n",
+		clk_get_rate(gmu->clks[0]), gmu->freq);
 
 	set_bit(GMU_CLK_ON, &device->gmu_core.flags);
 	return 0;

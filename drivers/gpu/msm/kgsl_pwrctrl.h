@@ -31,7 +31,7 @@ struct kgsl_device;
 #define KGSL_MAX_CLKS 18
 #define KGSL_MAX_REGULATORS 2
 
-#define KGSL_MAX_PWRLEVELS 11
+#define KGSL_MAX_PWRLEVELS 16
 
 /* Only two supported levels, min & max */
 #define KGSL_CONSTRAINT_PWR_MAXLEVELS 2
@@ -222,6 +222,7 @@ struct kgsl_pwrctrl {
 	unsigned int max_pwrlevel;
 	unsigned int min_pwrlevel;
 	unsigned int num_pwrlevels;
+	unsigned int opp_table_index;
 	unsigned int throttle_mask;
 	unsigned long interval_timeout;
 	u64 clock_times[KGSL_MAX_PWRLEVELS];

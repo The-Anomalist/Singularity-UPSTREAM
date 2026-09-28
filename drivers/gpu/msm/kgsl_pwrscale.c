@@ -1389,7 +1389,8 @@ int kgsl_pwrscale_init(struct device *dev, const char *governor)
 		 * to have an opp table handle to calculate the min/max
 		 * frequency.
 		 */
-		ret = dev_pm_opp_of_add_table(device->busmondev);
+		ret = dev_pm_opp_of_add_table_indexed(device->busmondev,
+			pwr->opp_table_index);
 		/*
 		 * Disable OPP which are not supported as per GPU freq plan.
 		 * This is need to ensure freq_table specified in bus_profile
