@@ -19,6 +19,7 @@
 #include <linux/zsmalloc.h>
 #include <linux/crypto.h>
 #include <linux/spinlock.h>
+#include <linux/workqueue.h>
 
 #include "zcomp.h"
 #include "zram_dedup.h"
@@ -103,6 +104,9 @@ struct zram_stats {
 					 * duplicated
 					 */
 	atomic64_t meta_data_size;	/* size of zram_entries */
+	atomic64_t recompr_pages;	/* pages successfully recompressed */
+	atomic64_t recompr_saved_bytes; /* bytes saved by recompression */
+	atomic64_t recompr_scans;	/* automatic recompression passes */
 };
 
 struct zram_hash {
@@ -133,6 +137,10 @@ struct zram {
 	u64 disksize;	/* bytes */
 	char compressor[CRYPTO_MAX_ALG_NAME];
 	char recomp_algorithm[CRYPTO_MAX_ALG_NAME];
+
+	/* Singularity automatic cold ZRAM recompression */
+	struct delayed_work recompress_work;
+	unsigned long recompress_cursor;
 	/*
 	 * zram is claimed so open request will be failed
 	 */

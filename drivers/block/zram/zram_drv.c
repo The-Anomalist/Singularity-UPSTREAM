@@ -33,6 +33,7 @@
 #include <linux/sysfs.h>
 #include <linux/debugfs.h>
 #include <linux/cpuhotplug.h>
+#include <linux/workqueue.h>
 
 #include "zram_drv.h"
 
@@ -1869,6 +1870,13 @@ static void zram_reset_device(struct zram *zram)
 	struct zcomp *comp;
 	u64 disksize;
 
+	/*
+	 * The recompression worker takes init_lock for the lifetime of a
+	 * pass. Stop it before taking the write side of init_lock to avoid
+	 * teardown races and lock inversion.
+	 */
+	cancel_delayed_work_sync(&zram->recompress_work);
+
 	down_write(&zram->init_lock);
 
 	zram->limit_pages = 0;
@@ -1941,9 +1949,20 @@ static ssize_t disksize_store(struct device *dev,
 		}
 	}
 	zram->disksize = disksize;
+	zram->recompress_cursor = 0;
 	set_capacity(zram->disk, zram->disksize >> SECTOR_SHIFT);
 
 	revalidate_disk(zram->disk);
+
+	/*
+	 * Give freshly-created swap some time to establish its working set.
+	 * The worker itself only touches genuinely cold entries.
+	 */
+	if (zram->recomp)
+		queue_delayed_work(system_freezable_wq,
+				   &zram->recompress_work,
+				   120 * HZ);
+
 	up_write(&zram->init_lock);
 
 	return len;
@@ -2062,22 +2081,322 @@ static ssize_t recompress_algorithm_store(struct device *dev,
 #define RECOMPRESS_IDLE		BIT(0)
 #define RECOMPRESS_HUGE		BIT(1)
 
+/*
+ * Singularity automatic cold ZRAM recompression
+ *
+ * Normal swap writes stay on the fast primary compressor.  Cold objects are
+ * revisited asynchronously and, only when worthwhile, moved to the denser
+ * secondary compressor.
+ *
+ * Keep the worker deliberately bounded.  It must never become foreground
+ * reclaim or compete aggressively with an interactive workload.
+ */
+#define ZRAM_RECOMPRESS_INTERVAL		(20 * HZ)
+#define ZRAM_RECOMPRESS_COLD_SEC		120
+#define ZRAM_RECOMPRESS_SCAN_MAX	32768UL
+#define ZRAM_RECOMPRESS_BATCH_MAX	1024UL
+#define ZRAM_RECOMPRESS_MIN_SAVING	128U
+
+static int zram_recompress_pages(struct zram *zram, int mode, bool automatic)
+{
+	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
+	unsigned long scan_limit;
+	unsigned long start;
+	unsigned long scanned;
+	unsigned long recompressed = 0;
+	struct page *page;
+	struct page *comp_page;
+	int ret = 0;
+#ifdef CONFIG_ZRAM_MEMORY_TRACKING
+	ktime_t cutoff = 0;
+
+	if (automatic)
+		cutoff = ktime_sub_ns(ktime_get_boottime(),
+				     (u64)ZRAM_RECOMPRESS_COLD_SEC *
+				     NSEC_PER_SEC);
+#endif
+
+	if (!nr_pages || !zram->recomp)
+		return 0;
+
+	if (zram_dedup_enabled(zram))
+		return -EOPNOTSUPP;
+
+	page = alloc_page(GFP_KERNEL);
+	if (!page)
+		return -ENOMEM;
+
+	/*
+	 * Keep a separate one-page compression staging buffer.  This lets us
+	 * release the per-CPU zcomp stream before doing a potentially sleeping
+	 * zsmalloc allocation.
+	 */
+	comp_page = alloc_page(GFP_KERNEL);
+	if (!comp_page) {
+		__free_page(page);
+		return -ENOMEM;
+	}
+
+	if (automatic) {
+		scan_limit = min_t(unsigned long, nr_pages,
+				   ZRAM_RECOMPRESS_SCAN_MAX);
+		start = zram->recompress_cursor;
+		if (start >= nr_pages)
+			start = 0;
+	} else {
+		scan_limit = nr_pages;
+		start = 0;
+	}
+
+	for (scanned = 0; scanned < scan_limit; scanned++) {
+		struct zram_entry *entry = NULL;
+		struct zram_entry *old_entry;
+		struct zcomp_strm *zstrm;
+		unsigned long alloced_pages;
+		unsigned long index = start + scanned;
+		unsigned int comp_len = 0;
+		unsigned int old_size;
+		unsigned int saved;
+		bool was_idle;
+		gfp_t gfp = GFP_NOIO | __GFP_HIGHMEM |
+			    __GFP_MOVABLE | __GFP_CMA;
+		void *src;
+		void *dst;
+		int err;
+#ifdef CONFIG_ZRAM_MEMORY_TRACKING
+		ktime_t old_ac_time;
+#endif
+
+		if (index >= nr_pages)
+			index -= nr_pages;
+
+		if (automatic &&
+		    recompressed >= ZRAM_RECOMPRESS_BATCH_MAX)
+			break;
+
+		zram_slot_lock(zram, index);
+
+		if (!zram_allocated(zram, index) ||
+		    zram_test_flag(zram, index, ZRAM_WB) ||
+		    zram_test_flag(zram, index, ZRAM_SAME) ||
+		    zram_test_flag(zram, index, ZRAM_UNDER_WB) ||
+		    zram_test_flag(zram, index, ZRAM_RECOMP)) {
+			zram_slot_unlock(zram, index);
+			continue;
+		}
+
+		if (!automatic) {
+			if ((mode & RECOMPRESS_IDLE) &&
+			    !zram_test_flag(zram, index, ZRAM_IDLE)) {
+				zram_slot_unlock(zram, index);
+				continue;
+			}
+
+			if ((mode & RECOMPRESS_HUGE) &&
+			    !zram_test_flag(zram, index, ZRAM_HUGE)) {
+				zram_slot_unlock(zram, index);
+				continue;
+			}
+		} else {
+#ifdef CONFIG_ZRAM_MEMORY_TRACKING
+			/*
+			 * ac_time is refreshed by normal zram I/O.  Do not
+			 * recompress entries that have been touched recently.
+			 */
+			if (!zram->table[index].ac_time ||
+			    !ktime_before(zram->table[index].ac_time,
+					  cutoff)) {
+				zram_slot_unlock(zram, index);
+				continue;
+			}
+#else
+			/*
+			 * Automatic cold detection requires access-time
+			 * tracking. Manual recompression remains available.
+			 */
+			zram_slot_unlock(zram, index);
+			continue;
+#endif
+		}
+
+		old_entry = zram_get_entry(zram, index);
+		old_size = zram_get_obj_size(zram, index);
+		was_idle = zram_test_flag(zram, index, ZRAM_IDLE);
+#ifdef CONFIG_ZRAM_MEMORY_TRACKING
+		old_ac_time = zram->table[index].ac_time;
+#endif
+
+		zram_slot_unlock(zram, index);
+
+		/*
+		 * Re-read the object through the normal zram path so both
+		 * compressed and incompressible objects are handled correctly.
+		 */
+		err = __zram_bvec_read(zram, page, index, NULL, false);
+		if (err)
+			continue;
+
+		zstrm = zcomp_stream_get(zram->recomp);
+
+		src = page_address(page);
+		err = zcomp_compress(zstrm, src, &comp_len);
+		if (err) {
+			zcomp_stream_put(zram->recomp);
+			continue;
+		}
+
+		/*
+		 * Only keep secondary compression when it is genuinely better.
+		 * The automatic path additionally requires a meaningful saving
+		 * so CPU time is not spent trading metadata for tiny wins.
+		 */
+		if (comp_len >= huge_class_size ||
+		    comp_len >= old_size ||
+		    (automatic &&
+		     old_size - comp_len < ZRAM_RECOMPRESS_MIN_SAVING)) {
+			zcomp_stream_put(zram->recomp);
+			continue;
+		}
+
+		memcpy(page_address(comp_page), zstrm->buffer, comp_len);
+		zcomp_stream_put(zram->recomp);
+
+		/*
+		 * zram_entry_alloc() may sleep.  The per-CPU compression
+		 * stream has already been released above.
+		 */
+		entry = zram_entry_alloc(zram, comp_len, gfp);
+		if (!entry) {
+			ret = -ENOMEM;
+			break;
+		}
+
+		alloced_pages = zs_get_total_pages(zram->mem_pool);
+		if (zram->limit_pages &&
+		    alloced_pages > zram->limit_pages) {
+			zram_entry_free(zram, entry);
+			ret = -ENOMEM;
+			break;
+		}
+
+		dst = zs_map_object(zram->mem_pool,
+				     zram_entry_handle(zram, entry),
+				     ZS_MM_WO);
+		memcpy(dst, page_address(comp_page), comp_len);
+		zs_unmap_object(zram->mem_pool,
+				zram_entry_handle(zram, entry));
+
+		/*
+		 * The slot was unlocked during decompression/compression.
+		 * Revalidate both the object identity and its metadata before
+		 * replacing anything.  If normal I/O touched or replaced the
+		 * slot, throw our candidate away.
+		 */
+		zram_slot_lock(zram, index);
+
+		if (!zram_allocated(zram, index) ||
+		    zram_test_flag(zram, index, ZRAM_WB) ||
+		    zram_test_flag(zram, index, ZRAM_SAME) ||
+		    zram_test_flag(zram, index, ZRAM_UNDER_WB) ||
+		    zram_test_flag(zram, index, ZRAM_RECOMP) ||
+		    zram_get_entry(zram, index) != old_entry ||
+		    zram_get_obj_size(zram, index) != old_size
+#ifdef CONFIG_ZRAM_MEMORY_TRACKING
+		    || ktime_compare(zram->table[index].ac_time,
+				     old_ac_time)
+#endif
+		    ) {
+			zram_slot_unlock(zram, index);
+			zram_entry_free(zram, entry);
+			continue;
+		}
+
+		saved = old_size - comp_len;
+
+		zram_free_page(zram, index);
+
+		zram_set_entry(zram, index, entry);
+		zram_set_obj_size(zram, index, comp_len);
+		zram_set_flag(zram, index, ZRAM_RECOMP);
+
+		if (was_idle)
+			zram_set_flag(zram, index, ZRAM_IDLE);
+
+#ifdef CONFIG_ZRAM_MEMORY_TRACKING
+		/*
+		 * zram_free_page() clears ac_time. Preserve it so coldness
+		 * history remains correct after moving the object.
+		 */
+		zram->table[index].ac_time = old_ac_time;
+#endif
+
+		atomic64_add(comp_len, &zram->stats.compr_data_size);
+		atomic64_inc(&zram->stats.pages_stored);
+
+		atomic64_inc(&zram->stats.recompr_pages);
+		atomic64_add(saved, &zram->stats.recompr_saved_bytes);
+
+		update_used_max(zram,
+				zs_get_total_pages(zram->mem_pool));
+
+		zram_slot_unlock(zram, index);
+
+		recompressed++;
+	}
+
+	if (automatic) {
+		unsigned long next = start + scanned;
+
+		if (nr_pages)
+			next %= nr_pages;
+
+		zram->recompress_cursor = next;
+		atomic64_inc(&zram->stats.recompr_scans);
+	}
+
+	__free_page(comp_page);
+	__free_page(page);
+
+	return ret;
+}
+
+static void zram_recompress_workfn(struct work_struct *work)
+{
+	struct zram *zram =
+		container_of(to_delayed_work(work), struct zram,
+			     recompress_work);
+
+	down_read(&zram->init_lock);
+
+	if (init_done(zram) && zram->recomp)
+		zram_recompress_pages(zram, 0, true);
+
+	/*
+	 * Re-arm while holding init_lock.  Device reset first synchronously
+	 * cancels this work before taking the write side of init_lock.
+	 */
+	if (init_done(zram) && zram->recomp)
+		queue_delayed_work(system_freezable_wq,
+				   &zram->recompress_work,
+				   ZRAM_RECOMPRESS_INTERVAL);
+
+	up_read(&zram->init_lock);
+}
+
 static ssize_t recompress_store(struct device *dev,
-				struct device_attribute *attr, const char *buf,
-				size_t len)
+				struct device_attribute *attr,
+				const char *buf, size_t len)
 {
 	struct zram *zram = dev_to_zram(dev);
-	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
-	unsigned long index;
-	struct page *page;
 	char mode_buf[16];
 	ssize_t sz;
 	int mode = -1;
-	int ret = len;
+	int ret;
 
 	sz = strscpy(mode_buf, buf, sizeof(mode_buf));
 	if (sz <= 0)
 		return -EINVAL;
+
 	if (mode_buf[sz - 1] == '\n')
 		mode_buf[sz - 1] = 0x00;
 
@@ -2092,114 +2411,36 @@ static ssize_t recompress_store(struct device *dev,
 		return -EINVAL;
 
 	down_read(&zram->init_lock);
+
 	if (!init_done(zram) || !zram->recomp) {
 		ret = -EINVAL;
-		goto out_unlock;
+		goto out;
 	}
 
-	if (zram_dedup_enabled(zram)) {
-		ret = -EOPNOTSUPP;
-		goto out_unlock;
-	}
+	ret = zram_recompress_pages(zram, mode, false);
+	if (!ret)
+		ret = len;
 
-	page = alloc_page(GFP_KERNEL);
-	if (!page) {
-		ret = -ENOMEM;
-		goto out_unlock;
-	}
+out:
+	up_read(&zram->init_lock);
+	return ret;
+}
 
-	for (index = 0; index < nr_pages; index++) {
-		struct zram_entry *entry = NULL;
-		struct zcomp_strm *zstrm;
-		unsigned long alloced_pages;
-		unsigned int comp_len = 0;
-		unsigned int old_size;
-		bool was_idle;
-		gfp_t gfp = GFP_NOIO | __GFP_HIGHMEM | __GFP_MOVABLE | __GFP_CMA;
-		void *src, *dst;
-		int err;
+static ssize_t recompress_stat_show(struct device *dev,
+				    struct device_attribute *attr,
+				    char *buf)
+{
+	struct zram *zram = dev_to_zram(dev);
+	ssize_t ret;
 
-		zram_slot_lock(zram, index);
-		if (!zram_allocated(zram, index) ||
-		    zram_test_flag(zram, index, ZRAM_WB) ||
-		    zram_test_flag(zram, index, ZRAM_SAME) ||
-		    zram_test_flag(zram, index, ZRAM_UNDER_WB) ||
-		    zram_test_flag(zram, index, ZRAM_RECOMP) ||
-		    ((mode & RECOMPRESS_IDLE) &&
-		     !zram_test_flag(zram, index, ZRAM_IDLE)) ||
-		    ((mode & RECOMPRESS_HUGE) &&
-		     !zram_test_flag(zram, index, ZRAM_HUGE))) {
-			zram_slot_unlock(zram, index);
-			continue;
-		}
-		old_size = zram_get_obj_size(zram, index);
-		was_idle = zram_test_flag(zram, index, ZRAM_IDLE);
-		zram_slot_unlock(zram, index);
+	down_read(&zram->init_lock);
 
-		err = __zram_bvec_read(zram, page, index, NULL, false);
-		if (err)
-			continue;
+	ret = scnprintf(buf, PAGE_SIZE,
+			"%llu %llu %llu\n",
+			(u64)atomic64_read(&zram->stats.recompr_pages),
+			(u64)atomic64_read(&zram->stats.recompr_saved_bytes),
+			(u64)atomic64_read(&zram->stats.recompr_scans));
 
-		zstrm = zcomp_stream_get(zram->recomp);
-		src = page_address(page);
-		err = zcomp_compress(zstrm, src, &comp_len);
-		if (err) {
-			zcomp_stream_put(zram->recomp);
-			continue;
-		}
-
-		if (comp_len >= huge_class_size || comp_len >= old_size) {
-			zcomp_stream_put(zram->recomp);
-			continue;
-		}
-
-		entry = zram_entry_alloc(zram, comp_len, gfp);
-		if (!entry) {
-			zcomp_stream_put(zram->recomp);
-			ret = -ENOMEM;
-			break;
-		}
-
-		alloced_pages = zs_get_total_pages(zram->mem_pool);
-		if (zram->limit_pages && alloced_pages > zram->limit_pages) {
-			zcomp_stream_put(zram->recomp);
-			zram_entry_free(zram, entry);
-			ret = -ENOMEM;
-			break;
-		}
-
-		dst = zs_map_object(zram->mem_pool,
-				    zram_entry_handle(zram, entry), ZS_MM_WO);
-		memcpy(dst, zstrm->buffer, comp_len);
-		zs_unmap_object(zram->mem_pool, zram_entry_handle(zram, entry));
-		zcomp_stream_put(zram->recomp);
-
-		zram_slot_lock(zram, index);
-		if (!zram_allocated(zram, index) ||
-		    zram_test_flag(zram, index, ZRAM_WB) ||
-		    zram_test_flag(zram, index, ZRAM_SAME) ||
-		    zram_test_flag(zram, index, ZRAM_UNDER_WB) ||
-		    zram_test_flag(zram, index, ZRAM_RECOMP) ||
-		    zram_get_obj_size(zram, index) != old_size) {
-			zram_slot_unlock(zram, index);
-			zram_entry_free(zram, entry);
-			continue;
-		}
-
-		zram_free_page(zram, index);
-		zram_set_entry(zram, index, entry);
-		zram_set_obj_size(zram, index, comp_len);
-		zram_set_flag(zram, index, ZRAM_RECOMP);
-		if (was_idle)
-			zram_set_flag(zram, index, ZRAM_IDLE);
-		atomic64_add(comp_len, &zram->stats.compr_data_size);
-		atomic64_inc(&zram->stats.pages_stored);
-		update_used_max(zram, zs_get_total_pages(zram->mem_pool));
-		zram_slot_unlock(zram, index);
-	}
-
-	__free_page(page);
-out_unlock:
 	up_read(&zram->init_lock);
 
 	return ret;
@@ -2223,6 +2464,7 @@ static DEVICE_ATTR_RW(max_comp_streams);
 static DEVICE_ATTR_RW(comp_algorithm);
 static DEVICE_ATTR_RW(recompress_algorithm);
 static DEVICE_ATTR_WO(recompress);
+static DEVICE_ATTR_RO(recompress_stat);
 #ifdef CONFIG_ZRAM_WRITEBACK
 static DEVICE_ATTR_RW(backing_dev);
 static DEVICE_ATTR_WO(writeback);
@@ -2247,6 +2489,7 @@ static struct attribute *zram_disk_attrs[] = {
 	&dev_attr_comp_algorithm.attr,
 	&dev_attr_recompress_algorithm.attr,
 	&dev_attr_recompress.attr,
+	&dev_attr_recompress_stat.attr,
 #ifdef CONFIG_ZRAM_WRITEBACK
 	&dev_attr_backing_dev.attr,
 	&dev_attr_writeback.attr,
@@ -2292,6 +2535,8 @@ static int zram_add(void)
 	device_id = ret;
 
 	init_rwsem(&zram->init_lock);
+	INIT_DELAYED_WORK(&zram->recompress_work,
+			  zram_recompress_workfn);
 #ifdef CONFIG_ZRAM_WRITEBACK
 	spin_lock_init(&zram->wb_limit_lock);
 #endif
@@ -2357,7 +2602,17 @@ static int zram_add(void)
 	disk_to_dev(zram->disk)->groups = zram_disk_attr_groups;
 	add_disk(zram->disk);
 
-	strlcpy(zram->compressor, default_compressor, sizeof(zram->compressor));
+	strlcpy(zram->compressor, default_compressor,
+		 sizeof(zram->compressor));
+
+	/*
+	 * Singularity keeps foreground ZRAM writes on the fast primary
+	 * compressor and automatically moves cold pages to ZSTD later.
+	 */
+#if IS_ENABLED(CONFIG_CRYPTO_ZSTD)
+	strlcpy(zram->recomp_algorithm, "zstd",
+		 sizeof(zram->recomp_algorithm));
+#endif
 
 	zram_debugfs_register(zram);
 	pr_info("Added device: %s\n", zram->disk->disk_name);
