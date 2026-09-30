@@ -72,7 +72,8 @@
  * A single 'zspage' is composed of up to 2^N discontiguous 0-order (single)
  * pages. ZS_MAX_ZSPAGE_ORDER defines upper limit on N.
  */
-#define ZS_MAX_ZSPAGE_ORDER 2
+/* Singularity: modern zspage packing */
+#define ZS_MAX_ZSPAGE_ORDER 3
 #define ZS_MAX_PAGES_PER_ZSPAGE (_AC(1, UL) << ZS_MAX_ZSPAGE_ORDER)
 
 #define ZS_HANDLE_SIZE (sizeof(unsigned long))
@@ -123,7 +124,7 @@
 
 #define FULLNESS_BITS	2
 #define CLASS_BITS	8
-#define ISOLATED_BITS	3
+#define ISOLATED_BITS	4
 #define MAGIC_VAL_BITS	8
 
 #define MAX(a, b) ((a) >= (b) ? (a) : (b))
@@ -259,6 +260,12 @@ struct zs_pool {
 	atomic_long_t pages_allocated;
 
 	struct zs_pool_stats stats;
+
+	/*
+	 * Only one pool compaction pass should run at a time. Concurrent
+	 * compactors duplicate migration work and increase class lock pressure.
+	 */
+	atomic_t compaction_in_progress;
 
 	/* Compact classes */
 	struct shrinker shrinker;
@@ -819,25 +826,42 @@ out:
  */
 static int get_pages_per_zspage(int class_size)
 {
-	int i, max_usedpc = 0;
-	/* zspage order which gives maximum used size per KB */
-	int max_usedpc_order = 1;
+	int i;
+	int min_waste = PAGE_SIZE;
+	int best_pages = 1;
 
+	/*
+	 * Power-of-two object sizes already divide PAGE_SIZE exactly, so
+	 * extending their chain cannot improve packing.
+	 */
+	if (is_power_of_2(class_size))
+		return 1;
+
+	/*
+	 * Singularity: modern zspage packing
+	 *
+	 * Choose the chain size which leaves the fewest unusable bytes
+	 * instead of comparing rounded integer utilization percentages.
+	 *
+	 * A longer chain can dramatically improve packing for awkward
+	 * compressed-object sizes while remaining bounded to eight pages.
+	 */
 	for (i = 1; i <= ZS_MAX_PAGES_PER_ZSPAGE; i++) {
-		int zspage_size;
-		int waste, usedpc;
+		int waste;
 
-		zspage_size = i * PAGE_SIZE;
-		waste = zspage_size % class_size;
-		usedpc = (zspage_size - waste) * 100 / zspage_size;
+		waste = (i * PAGE_SIZE) % class_size;
 
-		if (usedpc > max_usedpc) {
-			max_usedpc = usedpc;
-			max_usedpc_order = i;
+		if (waste < min_waste) {
+			min_waste = waste;
+			best_pages = i;
+
+			/* Cannot beat a perfect fit. */
+			if (!waste)
+				break;
 		}
 	}
 
-	return max_usedpc_order;
+	return best_pages;
 }
 
 static struct zspage *get_zspage(struct page *page)
@@ -2370,6 +2394,16 @@ unsigned long zs_compact(struct zs_pool *pool)
 	struct size_class *class;
 	unsigned long pages_freed = 0;
 
+	/*
+	 * Singularity: keep zsmalloc compaction single-flight.
+	 *
+	 * The shrinker can race another compaction trigger. A second pass
+	 * provides no useful benefit while the first one is already migrating
+	 * objects, but it can add considerable class-lock and CPU contention.
+	 */
+	if (atomic_xchg(&pool->compaction_in_progress, 1))
+		return 0;
+
 	for (i = ZS_SIZE_CLASSES - 1; i >= 0; i--) {
 		class = pool->size_class[i];
 		if (!class)
@@ -2378,7 +2412,9 @@ unsigned long zs_compact(struct zs_pool *pool)
 			continue;
 		pages_freed += __zs_compact(pool, class);
 	}
+
 	atomic_long_add(pages_freed, &pool->stats.pages_compacted);
+	atomic_set(&pool->compaction_in_progress, 0);
 
 	return pages_freed;
 }
@@ -2465,6 +2501,7 @@ struct zs_pool *zs_create_pool(const char *name)
 		return NULL;
 
 	init_deferred_free(pool);
+	atomic_set(&pool->compaction_in_progress, 0);
 
 	pool->name = kstrdup(name, GFP_KERNEL);
 	if (!pool->name)
