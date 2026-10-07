@@ -2508,8 +2508,10 @@ int mdss_dsi_panel_timing_switch(struct mdss_dsi_ctrl_pdata *ctrl,
 	for (i = 0; i < ARRAY_SIZE(pt->phy_timing_12nm); i++)
 		pinfo->mipi.dsi_phy_db.timing_12nm[i] = pt->phy_timing_12nm[i];
 
-	ctrl->on_cmds = pt->on_cmds;
-	ctrl->post_panel_on_cmds = pt->post_panel_on_cmds;
+	if (pt->on_cmds.cmd_cnt)
+		ctrl->on_cmds = pt->on_cmds;
+	if (pt->post_panel_on_cmds.cmd_cnt)
+		ctrl->post_panel_on_cmds = pt->post_panel_on_cmds;
 
 	ctrl->panel_data.current_timing = timing;
 	if (!timing->clk_rate)
