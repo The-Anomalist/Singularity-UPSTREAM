@@ -5,6 +5,7 @@
  */
 
 #include <linux/compat.h>
+#include <linux/iopoll.h>
 #include <linux/iommu.h>
 #include <linux/of_platform.h>
 #include <linux/seq_file.h>
@@ -2118,7 +2119,7 @@ static int kgsl_iommu_set_pt(struct kgsl_mmu *mmu, struct kgsl_pagetable *pt)
 	struct kgsl_iommu_context *ctx = &iommu->ctx[KGSL_IOMMU_CONTEXT_USER];
 	uint64_t ttbr0, temp;
 	unsigned int contextidr;
-	unsigned long wait_for_flush;
+	u32 tlb_status;
 
 	if ((pt != mmu->defaultpagetable) && !kgsl_mmu_is_perprocess(mmu))
 		return 0;
@@ -2138,24 +2139,15 @@ static int kgsl_iommu_set_pt(struct kgsl_mmu *mmu, struct kgsl_pagetable *pt)
 	KGSL_IOMMU_SET_CTX_REG(ctx, TLBIALL, 1);
 	/* make sure the TBLI write completes before we wait */
 	mb();
-	/*
-	 * Wait for flush to complete by polling the flush
-	 * status bit of TLBSTATUS register for not more than
-	 * 2 s. After 2s just exit, at that point the SMMU h/w
-	 * may be stuck and will eventually cause GPU to hang
-	 * or bring the system down.
-	 */
-	wait_for_flush = jiffies + msecs_to_jiffies(2000);
+	/* Yield the CPU while waiting for the IOMMU TLB flush. */
 	KGSL_IOMMU_SET_CTX_REG(ctx, TLBSYNC, 0);
-	while (KGSL_IOMMU_GET_CTX_REG(ctx, TLBSTATUS) &
-		(KGSL_IOMMU_CTX_TLBSTATUS_SACTIVE)) {
-		if (time_after(jiffies, wait_for_flush)) {
-			dev_warn(KGSL_MMU_DEVICE(mmu)->dev,
-				      "Wait limit reached for IOMMU tlb flush\n");
-			break;
-		}
-		cpu_relax();
-	}
+	if (readl_poll_timeout(
+		kgsl_iommu_reg(ctx, KGSL_IOMMU_CTX_TLBSTATUS),
+		tlb_status,
+		!(tlb_status & KGSL_IOMMU_CTX_TLBSTATUS_SACTIVE),
+		100, 1000000))
+		dev_warn(KGSL_MMU_DEVICE(mmu)->dev,
+			"Wait limit reached for IOMMU tlb flush\n");
 
 	kgsl_iommu_disable_clk(mmu);
 	return 0;
