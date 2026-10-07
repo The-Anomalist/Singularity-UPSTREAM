@@ -1887,6 +1887,7 @@ int adreno_gmu_fenced_write(struct adreno_device *adreno_dev,
 	enum adreno_regs offset, unsigned int val,
 	unsigned int fence_mask);
 int adreno_clear_pending_transactions(struct kgsl_device *device);
+unsigned int adreno_irq_pending(struct adreno_device *adreno_dev);
 void adreno_gmu_send_nmi(struct adreno_device *adreno_dev);
 void adreno_smmu_resume(struct adreno_device *adreno_dev);
 #endif /*__ADRENO_H */

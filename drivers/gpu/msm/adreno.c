@@ -3031,8 +3031,15 @@ inline unsigned int adreno_irq_pending(struct adreno_device *adreno_dev)
 {
 	struct adreno_gpudev *gpudev = ADRENO_GPU_DEVICE(adreno_dev);
 	unsigned int status;
+	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 
-	adreno_readreg(adreno_dev, ADRENO_REG_RBBM_INT_0_STATUS, &status);
+	/* Check pending GPU interrupts through the GMU shadow register. */
+	if (gmu_core_isenabled(device))
+		adreno_read_gmureg(adreno_dev,
+			ADRENO_REG_GMU_RBBM_INT_UNMASKED_STATUS, &status);
+	else
+		adreno_readreg(adreno_dev,
+			ADRENO_REG_RBBM_INT_0_STATUS, &status);
 
 	/*
 	 * IRQ handler clears the RBBM INT0 status register immediately

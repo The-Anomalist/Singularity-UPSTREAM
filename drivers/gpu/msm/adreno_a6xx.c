@@ -115,6 +115,7 @@ static u32 a650_pwrup_reglist[] = {
 	A6XX_TPL1_BICUBIC_WEIGHTS_TABLE_2,
 	A6XX_TPL1_BICUBIC_WEIGHTS_TABLE_3,
 	A6XX_TPL1_BICUBIC_WEIGHTS_TABLE_4,
+	A6XX_UCHE_GBIF_GX_CONFIG,
 };
 
 /* Applicable to a640 and a680 */
@@ -343,6 +344,11 @@ static void a6xx_hwcg_set(struct adreno_device *adreno_dev, bool on)
 	for (i = 0; i < a6xx_core->hwcg_count; i++)
 		kgsl_regwrite(device, a6xx_core->hwcg[i].offset,
 			on ? a6xx_core->hwcg[i].value : 0);
+
+	/* A650 GBIF L2 clock gating is separate from UCHE clock gating. */
+	if (adreno_is_a650(adreno_dev))
+		kgsl_regrmw(device, A6XX_UCHE_GBIF_GX_CONFIG,
+			0x70000, on ? 2 : 0);
 
 	/*
 	 * Enable SP clock after programming HWCG registers.
@@ -1050,7 +1056,7 @@ static bool a6xx_hw_isidle(struct adreno_device *adreno_dev)
 
 	gmu_core_regread(KGSL_DEVICE(adreno_dev),
 		A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS, &reg);
-	if (reg & GPUBUSYIGNAHB)
+	if ((reg & GPUBUSYIGNAHB) || adreno_irq_pending(adreno_dev))
 		return false;
 	return true;
 }
