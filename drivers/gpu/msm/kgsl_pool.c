@@ -16,7 +16,7 @@
 #include "kgsl_pool.h"
 #include "kgsl_sharedmem.h"
 
-#define KGSL_MAX_POOLS 4
+#define KGSL_MAX_POOLS 6
 #define KGSL_MAX_POOL_ORDER 8
 /*
  * Keep an upper bound for per-pool reservation requests from DT.
@@ -595,6 +595,10 @@ static void kgsl_of_parse_mempools(struct device_node *node)
 
 	for_each_child_of_node(node, child) {
 		unsigned int index;
+
+		/* Optional DT properties apply to this pool only. */
+		reserved_pages = 0;
+		max_pages = UINT_MAX;
 
 		if (of_property_read_u32(child, "reg", &index))
 			return;

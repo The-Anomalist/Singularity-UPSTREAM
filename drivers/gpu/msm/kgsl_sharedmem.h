@@ -371,20 +371,17 @@ static inline void kgsl_free_sgt(struct sg_table *sgt)
 static inline int kgsl_get_page_size(size_t size, unsigned int align,
 			struct kgsl_memdesc *memdesc)
 {
+	size_t pool_size;
+
 	if (memdesc->priv & KGSL_MEMDESC_USE_SHMEM)
 		return PAGE_SIZE;
 
-	if (align >= ilog2(SZ_1M) && size >= SZ_1M &&
-		kgsl_pool_avaialable(SZ_1M))
-		return SZ_1M;
-	else if (align >= ilog2(SZ_64K) && size >= SZ_64K &&
-		kgsl_pool_avaialable(SZ_64K))
-		return SZ_64K;
-	else if (align >= ilog2(SZ_8K) && size >= SZ_8K &&
-		kgsl_pool_avaialable(SZ_8K))
-		return SZ_8K;
-	else
-		return PAGE_SIZE;
+	for (pool_size = SZ_1M; pool_size > PAGE_SIZE; pool_size >>= 1)
+		if (align >= ilog2(pool_size) && size >= pool_size &&
+			kgsl_pool_avaialable(pool_size))
+			return pool_size;
+
+	return PAGE_SIZE;
 }
 #else
 static inline int kgsl_get_page_size(size_t size, unsigned int align)
