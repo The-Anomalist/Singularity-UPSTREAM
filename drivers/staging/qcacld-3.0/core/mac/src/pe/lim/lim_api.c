@@ -3013,6 +3013,17 @@ void lim_mon_init_session(struct mac_context *mac_ptr,
 	struct pe_session *psession_entry;
 	uint8_t session_id;
 
+	/*
+	 * Singularity: monitor init must be idempotent.
+	 * Never create a second PE session for the same vdev.
+	 */
+	psession_entry = pe_find_session_by_vdev_id(mac_ptr, msg->vdev_id);
+	if (psession_entry) {
+		pe_err("Monitor init skipped: vdev %u already has PE session %u",
+		       msg->vdev_id, psession_entry->peSessionId);
+		return;
+	}
+
 	psession_entry = pe_create_session(mac_ptr, msg->bss_id.bytes,
 					   &session_id,
 					   mac_ptr->lim.maxStation,
@@ -3032,7 +3043,8 @@ void lim_mon_deinit_session(struct mac_context *mac_ptr,
 {
 	struct pe_session *session;
 
-	session = pe_find_session_by_session_id(mac_ptr, msg->vdev_id);
+	/* The message carries a vdev ID, not a PE session-table ID. */
+	session = pe_find_session_by_vdev_id(mac_ptr, msg->vdev_id);
 
 	if (session && session->bssType == eSIR_MONITOR_MODE)
 		pe_delete_session(mac_ptr, session);

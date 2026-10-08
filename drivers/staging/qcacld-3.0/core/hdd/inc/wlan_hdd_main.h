@@ -97,6 +97,9 @@
 #include "wlan_hdd_oemdata.h"
 #endif
 #include "wlan_hdd_he.h"
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+#include "wlan_hdd_frame_inject.h"
+#endif
 
 #include <net/neighbour.h>
 #include <net/netevent.h>
@@ -1443,6 +1446,7 @@ struct hdd_adapter {
 	uint16_t latency_level;
 #ifdef FEATURE_MONITOR_MODE_SUPPORT
 	bool monitor_mode_vdev_up_in_progress;
+	bool monitor_mode_vdev_failed;
 #endif
 	/* rcpi information */
 	struct rcpi_info rcpi;
@@ -1484,6 +1488,10 @@ struct hdd_adapter {
 	uint8_t gro_flushed[DP_MAX_RX_THREADS];
 	bool delete_in_progress;
 	qdf_atomic_t net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX];
+
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+	struct hdd_injection_ctx *injection_ctx;
+#endif
 };
 
 #define WLAN_HDD_GET_STATION_CTX_PTR(adapter) (&(adapter)->session.station)
@@ -4730,14 +4738,14 @@ static inline void hdd_sta_destroy_ctx_all(struct hdd_context *hdd_ctx)
 
 #ifdef FEATURE_MONITOR_MODE_SUPPORT
 
-void hdd_sme_monitor_mode_callback(uint8_t vdev_id);
+void hdd_sme_monitor_mode_callback(uint32_t completion);
 
 QDF_STATUS hdd_monitor_mode_vdev_status(struct hdd_adapter *adapter);
 
 QDF_STATUS hdd_monitor_mode_qdf_create_event(struct hdd_adapter *adapter,
 					     uint8_t session_type);
 #else
-static inline void hdd_sme_monitor_mode_callback(uint8_t vdev_id) {}
+static inline void hdd_sme_monitor_mode_callback(uint32_t completion) {}
 
 static inline QDF_STATUS
 hdd_monitor_mode_vdev_status(struct hdd_adapter *adapter)

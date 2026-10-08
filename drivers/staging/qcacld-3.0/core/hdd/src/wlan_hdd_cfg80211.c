@@ -29,6 +29,8 @@
 #include <linux/init.h>
 #include <linux/etherdevice.h>
 #include <linux/wireless.h>
+#include <linux/cred.h>
+#include <linux/uidgid.h>
 #include "osif_sync.h"
 #include <wlan_hdd_includes.h>
 #include <net/arp.h>
@@ -150,6 +152,9 @@
 #include "wlan_hdd_thermal.h"
 #include <ol_defines.h>
 #include "wlan_hdd_cfr.h"
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+#include "wlan_hdd_frame_inject.h"
+#endif
 #include <qdf_hang_event_notifier.h>
 #include "hif.h"
 #include "wlan_hdd_ioctl.h"
@@ -15814,8 +15819,12 @@ const struct wiphy_vendor_command hdd_wiphy_vendor_commands[] = {
 	},
 #endif
 	FEATURE_SAR_LIMITS_VENDOR_COMMANDS
-	BCN_RECV_FEATURE_VENDOR_COMMANDS
-
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+	FEATURE_FRAME_INJECTION_VENDOR_COMMANDS,
+#endif
+#ifdef WLAN_BCN_RECV_FEATURE
+	BCN_RECV_FEATURE_VENDOR_COMMANDS,
+#endif
 	{
 		.info.vendor_id = QCA_NL80211_VENDOR_ID,
 		.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_SET_SAR_LIMITS,
@@ -17315,6 +17324,32 @@ static int __wlan_hdd_cfg80211_change_iface(struct wiphy *wiphy,
 		  ndev->name,
 		  qdf_opmode_str(adapter->device_mode),
 		  qdf_opmode_str(new_mode));
+
+	if (adapter->device_mode == QDF_MONITOR_MODE &&
+	    new_mode == QDF_MONITOR_MODE) {
+		ndev->ieee80211_ptr->iftype = type;
+		hdd_exit();
+		return 0;
+	}
+
+	/*
+	 * Android framework daemons can race monitor mode by forcing station
+	 * iftype transitions right after monitor enable. Reject non-root
+	 * monitor->non-monitor requests while monitor global mode is active.
+	 *
+	 * Return an error instead of success so cfg80211 doesn't WARN on
+	 * iftype mismatch (it expects iftype to match @type when callback
+	 * returns success).
+	 */
+	if ((adapter->device_mode == QDF_MONITOR_MODE ||
+	     hdd_get_conparam() == QDF_GLOBAL_MONITOR_MODE) &&
+	    new_mode != QDF_MONITOR_MODE &&
+	    !uid_eq(current_euid(), GLOBAL_ROOT_UID)) {
+		hdd_warn_rl("rejecting monitor->%s iface change from %s",
+			    qdf_opmode_str(new_mode), current->comm);
+		hdd_exit();
+		return -EOPNOTSUPP;
+	}
 
 	errno = hdd_trigger_psoc_idle_restart(hdd_ctx);
 	if (errno) {
@@ -24016,6 +24051,71 @@ int wlan_hdd_change_hw_mode_for_given_chnl(struct hdd_adapter *adapter,
 
 #ifdef FEATURE_MONITOR_MODE_SUPPORT
 /**
+ * wlan_hdd_cfg80211_get_channel() - Report current operating channel
+ * @wiphy: wiphy handle
+ * @wdev: wireless_dev handle
+ * @chandef: output channel definition
+ *
+ * Required by nl80211 (NL80211_CMD_GET_INTERFACE) and wext (SIOCGIWFREQ)
+ * so that tools like aireplay-ng / mdk3 can determine the current channel.
+ *
+ * Return: 0 on success, -ENODATA if no channel is set.
+ */
+static int wlan_hdd_cfg80211_get_channel(struct wiphy *wiphy,
+					 struct wireless_dev *wdev,
+					 struct cfg80211_chan_def *chandef)
+{
+	struct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(wdev->netdev);
+	struct hdd_station_ctx *sta_ctx;
+	struct hdd_mon_set_ch_info *ch_info;
+	struct ieee80211_channel *chan;
+	uint32_t freq;
+
+	if (!adapter)
+		return -ENODATA;
+
+	/* Primary source: adapter->mon_chan_freq (set by both boot-time
+	 * monitor mode and cfg80211 set_monitor_channel).
+	 */
+	freq = adapter->mon_chan_freq;
+
+	/* Fallback: station context ch_info (set by hdd_mon_select_cbmode
+	 * in the roam callback path).
+	 */
+	if (!freq) {
+		sta_ctx = WLAN_HDD_GET_STATION_CTX_PTR(adapter);
+		ch_info = &sta_ctx->ch_info;
+		freq = ch_info->freq;
+	}
+
+	if (!freq)
+		return -ENODATA;
+
+	chan = ieee80211_get_channel(wiphy, freq);
+	if (!chan)
+		return -ENODATA;
+
+	cfg80211_chandef_create(chandef, chan, NL80211_CHAN_NO_HT);
+
+	/* Upgrade width if we know the bandwidth */
+	switch (adapter->mon_bandwidth) {
+	case CH_WIDTH_40MHZ:
+		chandef->width = NL80211_CHAN_WIDTH_40;
+		break;
+	case CH_WIDTH_80MHZ:
+		chandef->width = NL80211_CHAN_WIDTH_80;
+		break;
+	case CH_WIDTH_160MHZ:
+		chandef->width = NL80211_CHAN_WIDTH_160;
+		break;
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+/**
  * wlan_hdd_cfg80211_set_mon_ch() - Set monitor mode capture channel
  * @wiphy: Handle to struct wiphy to get handle to module context.
  * @chandef: Contains information about the capture channel to be set.
@@ -24035,8 +24135,8 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 	QDF_STATUS status;
 	mac_handle_t mac_handle;
 	struct qdf_mac_addr bssid;
-	struct csr_roam_profile roam_profile;
-	struct ch_params ch_params;
+	struct csr_roam_profile roam_profile = {0};
+	struct ch_params ch_params = {0};
 	int ret;
 	enum channel_state chan_freq_state;
 	uint8_t max_fw_bw;
@@ -24090,10 +24190,10 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 	ch_info = &sta_ctx->ch_info;
 	roam_profile.ChannelInfo.freq_list = &ch_info->freq;
 	roam_profile.ChannelInfo.numOfChannels = 1;
-	roam_profile.phyMode = ch_info->phy_mode;
 	roam_profile.ch_params.ch_width = ch_width;
 	hdd_select_cbmode(adapter, chandef->chan->center_freq,
 			  &roam_profile.ch_params);
+	roam_profile.phyMode = ch_info->phy_mode;
 
 	qdf_mem_copy(bssid.bytes, adapter->mac_addr.bytes,
 		     QDF_MAC_ADDR_SIZE);
@@ -24103,6 +24203,15 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 					     chandef->chan->center_freq,
 					     0, &ch_params);
 
+	if (adapter->monitor_mode_vdev_up_in_progress) {
+		/* Singularity monitor channel diagnostics */
+		hdd_err("Singularity monitor: BUSY vdev=%u requested_freq=%u current_freq=%u",
+			adapter->vdev_id,
+			chandef->chan->center_freq,
+			adapter->mon_chan_freq);
+		return -EBUSY;
+	}
+
 	if (wlan_hdd_change_hw_mode_for_given_chnl(adapter,
 						   chandef->chan->center_freq,
 						   POLICY_MGR_UPDATE_REASON_SET_OPER_CHAN)) {
@@ -24110,16 +24219,12 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 		return -EINVAL;
 	}
 
-	if (adapter->monitor_mode_vdev_up_in_progress) {
-		hdd_err_rl("monitor mode vdev up in progress");
-		return -EBUSY;
-	}
-
 	status = qdf_event_reset(&adapter->qdf_monitor_mode_vdev_up_event);
 	if (QDF_IS_STATUS_ERROR(status)) {
 		hdd_err_rl("failed to reinit monitor mode vdev up event");
 		return qdf_status_to_os_return(status);
 	}
+	WRITE_ONCE(adapter->monitor_mode_vdev_failed, false);
 	adapter->monitor_mode_vdev_up_in_progress = true;
 
 	status = sme_roam_channel_change_req(mac_handle, bssid,
@@ -24152,9 +24257,26 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 			hdd_err_rl("Failed monitor mode vdev up(status-%d)",
 				  status);
 
-		adapter->monitor_mode_vdev_up_in_progress = false;
+		/*
+		 * A real timeout leaves the firmware operation unresolved.
+		 * Keep the request blocked until interface reinitialization.
+		 */
+		if (status != QDF_STATUS_E_TIMEOUT)
+			adapter->monitor_mode_vdev_up_in_progress = false;
 		return qdf_status_to_os_return(status);
 	}
+
+	if (adapter->qdf_monitor_mode_vdev_up_event.force_set)
+		return -EIO;
+
+	adapter->monitor_mode_vdev_up_in_progress = false;
+	if (READ_ONCE(adapter->monitor_mode_vdev_failed)) {
+		hdd_err("Monitor firmware rejected channel change");
+		return -EIO;
+	}
+
+	adapter->mon_chan_freq = chandef->chan->center_freq;
+	adapter->mon_bandwidth = ch_width;
 
 	hdd_exit();
 
@@ -24178,10 +24300,17 @@ static int wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 	int errno;
 
 	errno = osif_psoc_sync_op_start(wiphy_dev(wiphy), &psoc_sync);
-	if (errno)
+	if (errno) {
+		hdd_err("Singularity monitor: sync rejected channel change errno=%d",
+			errno);
 		return errno;
+	}
 
 	errno = __wlan_hdd_cfg80211_set_mon_ch(wiphy, chandef);
+
+	if (errno)
+		hdd_err("Singularity monitor: channel handler failed errno=%d",
+			errno);
 
 	osif_psoc_sync_op_stop(psoc_sync);
 
@@ -24967,6 +25096,7 @@ static struct cfg80211_ops wlan_hdd_cfg80211_ops = {
 #endif
 #ifdef FEATURE_MONITOR_MODE_SUPPORT
 	.set_monitor_channel = wlan_hdd_cfg80211_set_mon_ch,
+	.get_channel = wlan_hdd_cfg80211_get_channel,
 #endif
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 5, 0)) || \
 	defined(CFG80211_ABORT_SCAN)

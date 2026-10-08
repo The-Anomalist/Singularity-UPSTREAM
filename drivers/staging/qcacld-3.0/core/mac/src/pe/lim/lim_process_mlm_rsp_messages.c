@@ -2859,10 +2859,40 @@ static void lim_handle_mon_switch_channel_rsp(struct pe_session *session,
 		return;
 
 	if (QDF_IS_STATUS_ERROR(status)) {
+		message.type = eWNI_SME_MONITOR_MODE_VDEV_UP;
+		message.bodyval = session->vdev_id | (1U << 8);
 		pe_err("Set channel failed for monitor mode");
-		wlan_vdev_mlme_sm_deliver_evt(session->vdev,
-					      WLAN_VDEV_SM_EV_START_REQ_FAIL,
-					      0, NULL);
+
+		pe_err("Singularity monitor failure: vdev=%u state=%u substate=%u restart=%d fw_status=%d",
+		       session->vdev_id,
+		       wlan_vdev_mlme_get_state(session->vdev),
+		       wlan_vdev_mlme_get_substate(session->vdev),
+		       wlan_vdev_is_restart_progress(session->vdev),
+		       status);
+
+		/*
+		 * Singularity: select the appropriate failure event
+		 * for the current vdev transition.
+		 */
+		if (QDF_IS_STATUS_SUCCESS(
+			    wlan_vdev_is_restart_progress(session->vdev)))
+			wlan_vdev_mlme_sm_deliver_evt(
+				session->vdev,
+				WLAN_VDEV_SM_EV_RESTART_REQ_FAIL,
+				sizeof(*session), session);
+		else
+			wlan_vdev_mlme_sm_deliver_evt(
+				session->vdev,
+				WLAN_VDEV_SM_EV_START_REQ_FAIL,
+				sizeof(*session), session);
+
+		if (QDF_IS_STATUS_ERROR(
+		    scheduler_post_message(QDF_MODULE_ID_PE,
+					   QDF_MODULE_ID_SME,
+					   QDF_MODULE_ID_SME,
+					   &message)))
+			pe_err("Failed to post monitor failure completion");
+
 		return;
 	}
 

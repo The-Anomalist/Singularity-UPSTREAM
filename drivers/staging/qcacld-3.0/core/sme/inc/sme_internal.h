@@ -401,7 +401,7 @@ struct sme_context {
 	sme_get_raom_scan_ch_callback roam_scan_ch_callback;
 	void *roam_scan_ch_get_context;
 #ifdef FEATURE_MONITOR_MODE_SUPPORT
-	void (*monitor_mode_cb)(uint8_t vdev_id);
+	void (*monitor_mode_cb)(uint32_t completion);
 #endif
 };
 

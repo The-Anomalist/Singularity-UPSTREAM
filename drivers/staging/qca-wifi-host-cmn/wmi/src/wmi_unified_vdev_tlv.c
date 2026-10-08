@@ -201,6 +201,16 @@ extract_vdev_start_resp_tlv(struct wmi_unified *wmi_handle, void *evt_buf,
 		break;
 	};
 	vdev_rsp->status = ev->status;
+
+	/*
+	 * Singularity: retain the original firmware failure details.
+	 * Diagnostic only; do not alter firmware response handling.
+	 */
+	if (ev->status)
+		WMI_LOGE("Singularity vdev response: id=%u type=%u requestor=%u raw_status=0x%08x",
+			 ev->vdev_id, ev->resp_type, ev->requestor_id,
+			 (unsigned int)ev->status);
+
 	vdev_rsp->chain_mask = ev->chain_mask;
 	vdev_rsp->smps_mode = ev->smps_mode;
 	vdev_rsp->mac_id = ev->mac_id;

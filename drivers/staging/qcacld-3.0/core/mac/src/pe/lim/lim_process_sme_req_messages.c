@@ -4952,7 +4952,13 @@ static void lim_process_sme_channel_change_request(struct mac_context *mac_ctx,
 		return;
 	}
 
-	if (session_entry->curr_op_freq == target_freq &&
+	/*
+	 * Monitor curr_op_freq is updated before the firmware result.
+	 * Equality alone cannot prove a previous request succeeded.
+	 * Keep monitor requests on the real start/restart completion path.
+	 */
+	if (session_entry->bssType != eSIR_MONITOR_MODE &&
+	    session_entry->curr_op_freq == target_freq &&
 	    session_entry->ch_width == ch_change_req->ch_width) {
 		pe_err("Target channel and mode is same as current channel and mode channel freq %d and mode %d",
 		       session_entry->curr_op_freq, session_entry->ch_width);

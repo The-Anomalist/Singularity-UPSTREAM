@@ -24,7 +24,12 @@
 #include <cds_sched.h>
 #include <cds_utils.h>
 #include "wlan_hdd_rx_monitor.h"
+#include "cdp_txrx_mon.h"
+#include "cdp_txrx_mon.h"
 #include "ol_txrx.h"
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+#include "wlan_hdd_frame_inject.h"
+#endif
 
 /**
  * hdd_rx_monitor_callback(): Callback function for receive monitor mode
@@ -122,12 +127,83 @@ int hdd_enable_monitor_mode(struct net_device *dev)
 {
 	void *soc = cds_get_context(QDF_MODULE_ID_SOC);
 	uint8_t vdev_id;
+	int ret;
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+	struct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(dev);
+#endif
 
 	hdd_enter_dev(dev);
 
 	vdev_id = cdp_get_mon_vdev_from_pdev(soc, OL_TXRX_PDEV_ID);
-	if (vdev_id < 0)
+	/*
+	 * CDP returns an unsigned vdev ID and may encode -EINVAL
+	 * in that return value. Never use a negative comparison.
+	 */
+	if (vdev_id == (uint8_t)-EINVAL || vdev_id == 0xff)
 		return -EINVAL;
 
-	return cdp_set_monitor_mode(soc, vdev_id, false);
+	ret = qdf_status_to_os_return(
+		cdp_set_monitor_mode(soc, vdev_id, false));
+	if (ret)
+		hdd_err("Monitor DP enable failed: vdev=%u errno=%d",
+			vdev_id, ret);
+
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+	/* Enable frame injection when monitor mode is enabled */
+	if (ret == 0 && adapter) {
+		if (QDF_IS_STATUS_ERROR(hdd_frame_inject_enable(adapter))) {
+			hdd_warn("Failed to enable frame injection");
+			/* Continue without frame injection */
+		}
+	}
+#endif
+
+	return ret;
+}
+
+/**
+ * hdd_disable_monitor_mode() - Disable monitor mode
+ * @dev: Pointer to the net_device structure
+ *
+ * This function disables monitor mode configuration on the hardware
+ * and also disables frame injection if it was enabled.
+ *
+ * Return: 0 for success; non-zero for failure
+ */
+int hdd_disable_monitor_mode(struct net_device *dev)
+{
+	void *soc = cds_get_context(QDF_MODULE_ID_SOC);
+	uint8_t vdev_id;
+	int ret;
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+	struct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(dev);
+#endif
+
+	hdd_enter_dev(dev);
+
+	vdev_id = cdp_get_mon_vdev_from_pdev(soc, OL_TXRX_PDEV_ID);
+	/*
+	 * CDP returns an unsigned vdev ID and may encode -EINVAL
+	 * in that return value. Never use a negative comparison.
+	 */
+	if (vdev_id == (uint8_t)-EINVAL || vdev_id == 0xff)
+		return -EINVAL;
+
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+	/* Disable frame injection when monitor mode is disabled */
+	if (adapter) {
+		if (QDF_IS_STATUS_ERROR(hdd_frame_inject_disable(adapter))) {
+			hdd_warn("Failed to disable frame injection");
+			/* Continue with monitor mode disable */
+		}
+	}
+#endif
+
+	/* Reset normal monitor filters and monitor_configured state. */
+	ret = qdf_status_to_os_return(
+		cdp_reset_monitor_mode(soc, OL_TXRX_PDEV_ID, false));
+	if (ret)
+		hdd_err("Monitor DP reset failed: errno=%d", ret);
+
+	return ret;
 }

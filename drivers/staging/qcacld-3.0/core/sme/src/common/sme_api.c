@@ -4027,6 +4027,8 @@ static uint8_t sme_get_nss_chain_shift(enum QDF_OPMODE device_mode)
 	switch (device_mode) {
 	case QDF_STA_MODE:
 		return STA_NSS_CHAINS_SHIFT;
+	case QDF_MONITOR_MODE:
+		return STA_NSS_CHAINS_SHIFT;
 	case QDF_SAP_MODE:
 		return SAP_NSS_CHAINS_SHIFT;
 	case QDF_P2P_GO_MODE:
@@ -16430,7 +16432,7 @@ end:
 #ifdef FEATURE_MONITOR_MODE_SUPPORT
 
 QDF_STATUS sme_set_monitor_mode_cb(mac_handle_t mac_handle,
-				   void (*monitor_mode_cb)(uint8_t vdev_id))
+				   void (*monitor_mode_cb)(uint32_t completion))
 {
 	QDF_STATUS qdf_status;
 	struct mac_context *mac = MAC_CONTEXT(mac_handle);
@@ -16446,7 +16448,7 @@ QDF_STATUS sme_set_monitor_mode_cb(mac_handle_t mac_handle,
 	return qdf_status;
 }
 
-QDF_STATUS sme_process_monitor_mode_vdev_up_evt(uint8_t vdev_id)
+QDF_STATUS sme_process_monitor_mode_vdev_up_evt(uint32_t completion)
 {
 	mac_handle_t mac_handle;
 	struct mac_context *mac;
@@ -16460,7 +16462,7 @@ QDF_STATUS sme_process_monitor_mode_vdev_up_evt(uint8_t vdev_id)
 	mac = MAC_CONTEXT(mac_handle);
 
 	if (mac->sme.monitor_mode_cb)
-		mac->sme.monitor_mode_cb(vdev_id);
+		mac->sme.monitor_mode_cb(completion);
 	else {
 		sme_warn_rl("monitor_mode_cb is not registered");
 		return QDF_STATUS_E_FAILURE;

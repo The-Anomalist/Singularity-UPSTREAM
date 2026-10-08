@@ -27,6 +27,7 @@
 #include "wlan_hdd_trace.h"
 #include "wlan_hdd_ioctl.h"
 #include "wlan_hdd_power.h"
+#include "wlan_hdd_frame_inject.h"
 #include "wlan_hdd_regulatory.h"
 #include "wlan_osif_request_manager.h"
 #include "wlan_hdd_driver_ops.h"
@@ -8504,15 +8505,29 @@ static int __hdd_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 	if (ret)
 		goto exit;
 
+	hdd_info("Received ioctl command: 0x%x", cmd);
+
 	switch (cmd) {
 	case (SIOCDEVPRIVATE + 1):
+		hdd_info("Processing SIOCDEVPRIVATE+1 ioctl");
 		if (in_compat_syscall())
 			ret = hdd_driver_compat_ioctl(adapter, ifr);
 		else
 			ret = hdd_driver_ioctl(adapter, ifr);
 		break;
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+	case SIOCDEVPRIVATE_FRAME_INJECT:
+		hdd_info("Processing frame injection ioctl: 0x%x", cmd);
+		ret = hdd_frame_inject_ioctl(dev, ifr, cmd);
+		break;
+#else
+	case SIOCDEVPRIVATE_FRAME_INJECT:
+		hdd_warn("Frame injection not compiled in");
+		ret = -EOPNOTSUPP;
+		break;
+#endif
 	default:
-		hdd_warn("unknown ioctl %d", cmd);
+		hdd_warn("unknown ioctl 0x%x", cmd);
 		ret = -EINVAL;
 		break;
 	}
