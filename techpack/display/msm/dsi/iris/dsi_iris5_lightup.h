@@ -20,6 +20,7 @@
 #define MDSS_MAX_PANEL_LEN 256
 
 #define HIGH_FREQ 120
+#define MID_FREQ 90
 #define LOW_FREQ 60
 #define FHD_H 2376
 #define QHD_H 3168
@@ -187,6 +188,7 @@ struct iris_cfg {
 
 	struct iris_ctrl_seq timing_switch_seq;
 	struct iris_ctrl_seq timing_switch_seq_1;
+	struct iris_ctrl_seq timing_switch_seq_2;
 
 	/* one wire gpio lock */
 	spinlock_t iris_1w_lock;

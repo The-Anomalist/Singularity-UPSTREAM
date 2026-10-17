@@ -56,6 +56,13 @@ static int32_t _iris_parse_timing_switch_seq(struct device_node *np,
 		return rc;
 	}
 
+	key = "pxlw,iris-timing-switch-sequence-2";
+	rc = iris_parse_optional_seq(np, key, &pcfg->timing_switch_seq_2);
+	if (rc != 0) {
+		IRIS_LOGE("%s(), failed to parse %s seq", __func__, key);
+		return rc;
+	}
+
 	return rc;
 }
 
@@ -86,6 +93,8 @@ void iris_send_timing_switch_pkt(void)
 
 	if ((refresh_rate == HIGH_FREQ) && (v_active == FHD_H))
 		pseq = &pcfg->timing_switch_seq_1;
+	else if ((refresh_rate == MID_FREQ) && (v_active == QHD_H))
+		pseq = &pcfg->timing_switch_seq_2;
 
 	IRIS_LOGI("%s, cmd list index: %d, v res: %d, fps: %d", __func__,
 		  pcfg->cmd_list_index, v_active, refresh_rate);
