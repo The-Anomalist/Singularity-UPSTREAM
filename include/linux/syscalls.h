@@ -393,6 +393,14 @@ asmlinkage long sys_renameat(int olddfd, const char __user * oldname,
 
 /* fs/namespace.c */
 asmlinkage long sys_umount(char __user *name, int flags);
+asmlinkage long sys_open_tree(int dfd, const char __user *filename,
+			      unsigned int flags);
+asmlinkage long sys_move_mount(int from_dfd,
+			       const char __user *from_pathname,
+			       int to_dfd,
+			       const char __user *to_pathname,
+			       unsigned int flags);
+
 asmlinkage long sys_mount(char __user *dev_name, char __user *dir_name,
 				char __user *type, unsigned long flags,
 				void __user *data);

@@ -751,6 +751,11 @@ __SC_COMP(__NR_epoll_pwait2, sys_epoll_pwait2, compat_sys_epoll_pwait2)
 __SYSCALL(__NR_process_mrelease, sys_process_mrelease)
 
 #undef __NR_syscalls
+#define __NR_open_tree 428
+__SYSCALL(__NR_open_tree, sys_open_tree)
+#define __NR_move_mount 429
+__SYSCALL(__NR_move_mount, sys_move_mount)
+
 #define __NR_syscalls 449
 
 /*

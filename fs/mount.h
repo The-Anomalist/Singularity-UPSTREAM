@@ -19,6 +19,15 @@ struct mnt_namespace {
 	unsigned int		pending_mounts;
 } __randomize_layout;
 
+/*
+ * Anonymous mount namespaces have no sequence number.
+ * They are used to own detached mount trees.
+ */
+static inline bool is_anon_ns(struct mnt_namespace *ns)
+{
+	return ns->seq == 0;
+}
+
 struct mnt_pcp {
 	int mnt_count;
 	int mnt_writers;
