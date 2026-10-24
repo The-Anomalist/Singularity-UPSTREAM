@@ -527,7 +527,7 @@
 				<&kona_icc KONA_ICC_GMU_TO_MEM>;
 		interconnect-names = "gmu-llcc", "gmu-ddr";
 
-		qcom,gmu-freq = <600000000>;
+		qcom,gmu-freq = <650000000>;
 		qcom,gmu-icc-bw-avg-kbps = <1 292968 585937 878906>;
 		qcom,gmu-icc-bw-peak-kbps = <1 1171875 2343750 3515625>;
 

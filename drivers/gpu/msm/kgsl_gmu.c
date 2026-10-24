@@ -1646,7 +1646,7 @@ static int gmu_read_dt_tunables(struct gmu_device *gmu)
 
 	gmu->freq = GMU_FREQUENCY;
 	if (!of_property_read_u32(dev->of_node, "qcom,gmu-freq", &freq) &&
-		freq >= 200000000 && freq <= 600000000)
+		freq >= 200000000 && freq <= 650000000)
 		gmu->freq = freq;
 	else if (freq)
 		dev_warn(dev, "Ignoring invalid qcom,gmu-freq=%u\n", freq);
@@ -1658,7 +1658,7 @@ static int gmu_read_dt_tunables(struct gmu_device *gmu)
 	rounded = clk_round_rate(gmu->clks[0], gmu->freq);
 	if (rounded < 0)
 		return (int)rounded;
-	if (rounded < 200000000 || rounded > 600000000)
+	if (rounded < 200000000 || rounded > 650000000)
 		return -EINVAL;
 
 	dev_info(dev, "GMU clock: requested %u Hz, selected %ld Hz\n",

@@ -16,3 +16,8 @@
 	oplus,dtsi_no = <20828>;
 	oplus,pcb_range = <0 56>;
 };
+
+/* Singularity: experimental fixed GMU 650 MHz. */
+&gmu {
+	qcom,gmu-freq = <650000000>;
+};

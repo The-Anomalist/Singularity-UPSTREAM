@@ -105,6 +105,7 @@ static const struct freq_tbl ftbl_gpu_cc_gmu_clk_src[] = {
 	F(200000000, P_GPLL0_OUT_MAIN_DIV, 1.5, 0, 0),
 	F(500000000, P_GPU_CC_PLL1_OUT_MAIN, 1, 0, 0),
 	F(600000000, P_GPU_CC_PLL1_OUT_MAIN, 1, 0, 0),
+	F(650000000, P_GPU_CC_PLL1_OUT_MAIN, 1, 0, 0),
 	{ }
 };
 
@@ -127,8 +128,8 @@ static struct clk_rcg2 gpu_cc_gmu_clk_src = {
 		.rate_max = (unsigned long[VDD_NUM]) {
 			[VDD_MIN] = 200000000,
 			[VDD_LOW] = 500000000,
-			/* Experimental GMU 600 MHz CX corner. */
-			[VDD_NOMINAL] = 600000000},
+			/* Experimental GMU 650 MHz CX corner; requires device validation. */
+			[VDD_NOMINAL] = 650000000},
 	},
 };
 
