@@ -266,7 +266,8 @@ static void wma_injection_reset_session_state(void)
 static QDF_STATUS
 wma_injection_ensure_tx_vdev(tp_wma_handle wma,
 			    uint8_t mon_vdev_id,
-			    uint32_t chanfreq)
+			    uint32_t chanfreq,
+			    const uint8_t *client_mac)
 {
 	struct vdev_create_params vcreate;
 	struct vdev_start_params vstart;
@@ -279,7 +280,12 @@ wma_injection_ensure_tx_vdev(tp_wma_handle wma,
 	QDF_STATUS status;
 
 	if (g_inj_tx_vdev.created) {
-		if (g_inj_tx_vdev.chanfreq == chanfreq)
+		/* NH helper client identity experiment */
+		if (g_inj_tx_vdev.chanfreq == chanfreq &&
+		    g_inj_tx_vdev.monitor_vdev_id == mon_vdev_id &&
+		    (!client_mac ||
+		     !qdf_mem_cmp(g_inj_tx_vdev.mac_addr, client_mac,
+				  QDF_MAC_ADDR_SIZE)))
 			return QDF_STATUS_SUCCESS;
 		/* Channel changed – tear down and recreate */
 		wma_injection_destroy_tx_vdev(wma);
@@ -320,8 +326,14 @@ wma_injection_ensure_tx_vdev(tp_wma_handle wma,
 		wma_err("Injection: cannot read monitor vdev MAC");
 		return QDF_STATUS_E_FAILURE;
 	}
-	qdf_mem_copy(inj_mac, mon_mac, QDF_MAC_ADDR_SIZE);
-	inj_mac[0] |= 0x02; /* locally-administered */
+	if (client_mac) {
+		qdf_mem_copy(inj_mac, client_mac, QDF_MAC_ADDR_SIZE);
+		wma_info("NHCLIENT helper identity: monitor=%u client=%pM freq=%u",
+			 mon_vdev_id, inj_mac, chanfreq);
+	} else {
+		qdf_mem_copy(inj_mac, mon_mac, QDF_MAC_ADDR_SIZE);
+		inj_mac[0] |= 0x02; /* locally-administered */
+	}
 
 	/* ---------- 1. VDEV CREATE (STA type) ---------- */
 	/*
@@ -1599,8 +1611,28 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 		 * to a beacon-only path → DISCARD).  Route through a hidden
 		 * AP vdev instead, which the FW accepts for mgmt TX.
 		 */
-		status = wma_injection_ensure_tx_vdev(wma_handle,
-						     vdev_id, tx_chanfreq);
+		{
+			const uint8_t *client_mac = NULL;
+
+			/*
+			 * Bind only to a unicast source of an open-system
+			 * authentication request (transaction sequence 1).
+			 * Other injected frame types retain the current identity.
+			 */
+			if (req->frame_len >= 30 &&
+			    (frame_data[0] & 0xfc) == 0xb0 &&
+			    !(frame_data[10] & 1) &&
+			    (frame_data[10] | frame_data[11] |
+			     frame_data[12] | frame_data[13] |
+			     frame_data[14] | frame_data[15]) &&
+			    frame_data[24] == 0 && frame_data[25] == 0 &&
+			    frame_data[26] == 1 && frame_data[27] == 0 &&
+			    frame_data[28] == 0 && frame_data[29] == 0)
+				client_mac = frame_data + 10;
+
+			status = wma_injection_ensure_tx_vdev(wma_handle,
+					vdev_id, tx_chanfreq, client_mac);
+		}
 		if (QDF_IS_STATUS_ERROR(status)) {
 			wma_err("Failed to create injection TX helper vdev: %d",
 				status);
@@ -1628,6 +1660,19 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 		wma_warn("Injection: descriptor cache busy; TX rejected");
 		qdf_nbuf_free(wmi_buf);
 		return QDF_STATUS_E_RESOURCES;
+	}
+
+	/* NH address audit: actual WMI payload before submission. */
+	if (req->frame_len >= 24 &&
+	    ((frame_data[0] & 0xfc) == 0x00 ||
+	     (frame_data[0] & 0xfc) == 0x20 ||
+	     (frame_data[0] & 0xfc) == 0xb0)) {
+		wma_info("NHADDR WMI session=%u desc=%u vdev=%u freq=%u len=%u fc=%02x seq=%02x%02x da=%pM sa=%pM bssid=%pM",
+			 req->session_id, mgmt_params.desc_id,
+			 mgmt_params.vdev_id, mgmt_params.chanfreq,
+			 req->frame_len, frame_data[0],
+			 frame_data[23], frame_data[22],
+			 &frame_data[4], &frame_data[10], &frame_data[16]);
 	}
 
 	status = wmi_mgmt_unified_cmd_send(wma_handle->wmi_handle, &mgmt_params);

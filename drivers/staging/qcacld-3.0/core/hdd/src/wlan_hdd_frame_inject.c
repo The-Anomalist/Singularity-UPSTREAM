@@ -392,6 +392,19 @@ QDF_STATUS hdd_process_frame_injection(struct hdd_adapter *adapter,
 		return QDF_STATUS_E_INVAL;
 	}
 
+	/* NH address audit: before validation and sanitization. */
+	if (req->frame_data && req->frame_len >= 24 &&
+	    ((req->frame_data[0] & 0xfc) == 0x00 ||
+	     (req->frame_data[0] & 0xfc) == 0x20 ||
+	     (req->frame_data[0] & 0xfc) == 0xb0)) {
+		hdd_warn("NHADDR HDD session=%u len=%u fc=%02x seq=%02x%02x da=%pM sa=%pM bssid=%pM",
+			 req->session_id, req->frame_len,
+			 req->frame_data[0],
+			 req->frame_data[23], req->frame_data[22],
+			 &req->frame_data[4], &req->frame_data[10],
+			 &req->frame_data[16]);
+	}
+
 	/* Check global enable flag */
 	if (!hdd_injection_is_globally_enabled()) {
 		hdd_inject_warn("Frame injection is globally disabled");

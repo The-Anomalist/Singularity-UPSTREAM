@@ -1156,13 +1156,20 @@ QDF_STATUS wma_handle_channel_switch_resp(tp_wma_handle wma,
 		wma_update_rate_flags_after_vdev_restart(wma, iface);
 	}
 
-	if (wma_is_vdev_in_ap_mode(wma, rsp->vdev_id) ||
-	    mlme_is_chan_switch_in_progress(iface->vdev))
+	/* Match monitor response events to the firmware response type. */
+	if (iface->type == WMI_VDEV_TYPE_MONITOR) {
+		if (rsp->resp_type == WMI_VDEV_RESTART_RESP_EVENT)
+			event = WLAN_VDEV_SM_EV_RESTART_RESP;
+		else
+			event = WLAN_VDEV_SM_EV_START_RESP;
+	} else if (wma_is_vdev_in_ap_mode(wma, rsp->vdev_id) ||
+		   mlme_is_chan_switch_in_progress(iface->vdev)) {
 		event = WLAN_VDEV_SM_EV_RESTART_RESP;
-	else
+	} else {
 		event = WLAN_VDEV_SM_EV_START_RESP;
+	}
 	wlan_vdev_mlme_sm_deliver_evt(iface->vdev, event,
-				      sizeof(rsp), rsp);
+				      sizeof(*rsp), rsp);
 
 	return QDF_STATUS_SUCCESS;
 }
