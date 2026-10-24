@@ -12775,6 +12775,7 @@ static enum power_supply_property smb5_batt_props[] = {
 	POWER_SUPPLY_PROP_FORCE_RECHARGE,
 	POWER_SUPPLY_PROP_FCC_STEPPER_ENABLE,
 #ifdef OPLUS_FEATURE_CHG_BASIC
+	POWER_SUPPLY_PROP_OP_DISABLE_CHARGE,
 	POWER_SUPPLY_PROP_VOLTAGE_MIN,
 	POWER_SUPPLY_PROP_CHARGE_NOW,
 	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
@@ -12811,9 +12812,11 @@ static int smb5_batt_get_prop(struct power_supply *psy, enum power_supply_proper
 		break;
 #endif
 
-#ifdef OPLUS_CUSTOM_OP_DEF
+#ifdef OPLUS_FEATURE_CHG_BASIC
 	case POWER_SUPPLY_PROP_OP_DISABLE_CHARGE:
-		val->intval = chg->chg_disabled;
+		if (!g_oplus_chip)
+			return -ENODEV;
+		val->intval = !g_oplus_chip->mmi_chg;
 		break;
 #endif
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
@@ -12982,6 +12985,15 @@ static int smb5_batt_set_prop(struct power_supply *psy, enum power_supply_proper
 	struct smb_charger *chg = power_supply_get_drvdata(psy);
 
 	switch (prop) {
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	case POWER_SUPPLY_PROP_OP_DISABLE_CHARGE:
+		if (val->intval != 0 && val->intval != 1)
+			return -EINVAL;
+		rc = oplus_chg_set_mmi_charging(g_oplus_chip, !val->intval);
+		if (!rc)
+			power_supply_changed(psy);
+		break;
+#endif
 	case POWER_SUPPLY_PROP_STATUS:
 		rc = smblib_set_prop_batt_status(chg, val);
 		break;
@@ -13074,6 +13086,10 @@ static int smb5_batt_prop_is_writeable(struct power_supply *psy, enum power_supp
 	int rc = 0;
 
 	switch (psp) {
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	case POWER_SUPPLY_PROP_OP_DISABLE_CHARGE:
+		return 1;
+#endif
 	case POWER_SUPPLY_PROP_STATUS:
 	case POWER_SUPPLY_PROP_INPUT_SUSPEND:
 	case POWER_SUPPLY_PROP_SYSTEM_TEMP_LEVEL:

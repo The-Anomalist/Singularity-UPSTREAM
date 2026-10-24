@@ -1742,6 +1742,7 @@ int oplus_chg_get_chargerid_switch_val(void);
 void oplus_chg_turn_on_charging(struct oplus_chg_chip *chip);
 void oplus_chg_turn_on_charging_in_work(void);
 void oplus_chg_turn_off_charging(struct oplus_chg_chip *chip);
+int oplus_chg_set_mmi_charging(struct oplus_chg_chip *chip, int val);
 int oplus_chg_get_cool_down_status(void);
 int oplus_chg_get_normal_cool_down_status(void);
 void oplus_smart_charge_by_cool_down(struct oplus_chg_chip *chip, int val);

@@ -779,23 +779,15 @@ static ssize_t mmi_charging_enable_show(struct device *dev, struct device_attrib
 	return sprintf(buf, "%d\n", chip->mmi_chg);
 }
 
-static ssize_t mmi_charging_enable_store(struct device *dev, struct device_attribute *attr, const char *buf,
-					 size_t count)
+/* Shared policy for the Oplus toggle and battery/op_disable_charge. */
+int oplus_chg_set_mmi_charging(struct oplus_chg_chip *chip, int val)
 {
-	int val = 0;
 	int ret = 0;
-	struct oplus_chg_chip *chip = NULL;
 
-	chip = (struct oplus_chg_chip *)dev_get_drvdata(oplus_battery_dir);
-	if (!chip) {
-		chg_err("chip is NULL\n");
+	if (!chip)
+		return -ENODEV;
+	if (val != 0 && val != 1)
 		return -EINVAL;
-	}
-
-	if (kstrtos32(buf, 0, &val)) {
-		chg_err("buf error\n");
-		return -EINVAL;
-	}
 
 	chg_err("set mmi_chg = [%d].\n", val);
 	chip->total_time = 0;
@@ -846,8 +838,22 @@ static ssize_t mmi_charging_enable_store(struct device *dev, struct device_attri
 		}
 	}
 
+
+	return ret;
+}
+
+static ssize_t mmi_charging_enable_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct oplus_chg_chip *chip = dev_get_drvdata(dev);
+	int val, ret;
+
+	if (kstrtos32(buf, 0, &val))
+		return -EINVAL;
+	ret = oplus_chg_set_mmi_charging(chip, !!val);
 	return ret < 0 ? ret : count;
 }
+
 static DEVICE_ATTR_RW(mmi_charging_enable);
 
 #ifdef CONFIG_OPLUS_CHARGER_MTK
