@@ -445,6 +445,8 @@ void lru_gen_adjust_scan(struct lruvec *lruvec, bool may_swap,
 	unsigned long anon_scan;
 	unsigned long file_scan;
 	unsigned long total;
+	unsigned long original_anon, original_file;
+	unsigned long flags;
 	unsigned long denom;
 	unsigned long anon_weight;
 	unsigned long file_weight;
@@ -465,10 +467,14 @@ void lru_gen_adjust_scan(struct lruvec *lruvec, bool may_swap,
 	file_scan = nr[LRU_INACTIVE_FILE] +
 		    nr[LRU_ACTIVE_FILE];
 
+	original_anon = anon_scan;
+	original_file = file_scan;
 	total = anon_scan + file_scan;
-	if (!total)
+	if (!total || !anon_scan || !file_scan ||
+	    !may_swap || !total_swap_pages)
 		return;
 
+	spin_lock_irqsave(&lruvec_pgdat(lruvec)->lru_lock, flags);
 	anon_weight = lrugen->pressure[LRU_GEN_ANON] + 1;
 	file_weight = lrugen->pressure[LRU_GEN_FILE] + 1;
 
@@ -525,6 +531,8 @@ void lru_gen_adjust_scan(struct lruvec *lruvec, bool may_swap,
 	else
 		file_weight += SWAP_CLUSTER_MAX;
 
+	spin_unlock_irqrestore(&lruvec_pgdat(lruvec)->lru_lock, flags);
+
 	denom = anon_weight + file_weight;
 	if (!denom)
 		return;
@@ -547,17 +555,23 @@ void lru_gen_adjust_scan(struct lruvec *lruvec, bool may_swap,
 	anon_scan = min(anon_scan, total);
 	file_scan = total - anon_scan;
 
+	/* Never invent scans for a type or active list the caller excluded. */
+	anon_scan = min(anon_scan, original_anon);
+	file_scan = min(file_scan, original_file);
+
 	nr[LRU_INACTIVE_ANON] =
 		min(nr[LRU_INACTIVE_ANON], anon_scan);
 
 	nr[LRU_ACTIVE_ANON] =
-		anon_scan - nr[LRU_INACTIVE_ANON];
+		min(nr[LRU_ACTIVE_ANON],
+		    anon_scan - nr[LRU_INACTIVE_ANON]);
 
 	nr[LRU_INACTIVE_FILE] =
 		min(nr[LRU_INACTIVE_FILE], file_scan);
 
 	nr[LRU_ACTIVE_FILE] =
-		file_scan - nr[LRU_INACTIVE_FILE];
+		min(nr[LRU_ACTIVE_FILE],
+		    file_scan - nr[LRU_INACTIVE_FILE]);
 }
 
 

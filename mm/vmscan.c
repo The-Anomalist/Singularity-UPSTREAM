@@ -2630,7 +2630,9 @@ out:
 		nr[lru] = scan;
 	}
 
-	lru_gen_adjust_scan(lruvec, sc->may_swap, nr);
+	/* Preserve exclusive scanning, swap restrictions and the OOM fallback. */
+	if (scan_balance == SCAN_FRACT)
+		lru_gen_adjust_scan(lruvec, sc->may_swap, nr);
 }
 
 /*
