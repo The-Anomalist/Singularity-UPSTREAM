@@ -1898,6 +1898,7 @@ out_ret:
 #ifdef CONFIG_KSU_MANUAL_HOOK
 extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
 			       void *argv, void *envp, int *flags);
+extern int ksu_install_su_fd(void);
 #endif
 
 static int do_execveat_common(int fd, struct filename *filename,
@@ -1906,10 +1907,31 @@ static int do_execveat_common(int fd, struct filename *filename,
 			      int flags)
 {
 #ifdef CONFIG_KSU_MANUAL_HOOK
-	if (filename)
-		ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
-#endif
+	int ksu_ret = 0;
+	int retval;
+
+	if (!IS_ERR_OR_NULL(filename))
+		ksu_ret = ksu_handle_execveat(&fd, &filename,
+					     &argv, &envp, &flags);
+
+	if (ksu_ret < 0) {
+		if (!IS_ERR_OR_NULL(filename))
+			putname(filename);
+		return ksu_ret;
+	}
+
+	retval = __do_execve_file(fd, filename, argv, envp, flags, NULL);
+	if (!retval && ksu_ret > 0) {
+		int session_fd = ksu_install_su_fd();
+
+		if (session_fd < 0)
+			pr_warn("KernelSU: install su session fd failed: %d\n",
+				session_fd);
+	}
+	return retval;
+#else
 	return __do_execve_file(fd, filename, argv, envp, flags, NULL);
+#endif
 }
 
 int do_execve_file(struct file *file, void *__argv, void *__envp)
