@@ -996,10 +996,33 @@ static int qcom_cpufreq_update_opp(struct device *cpu_dev,
 	unsigned long freq = (unsigned long)freq_khz * 1000;
 	int ret;
 
-	/* Unavailable lookup is intentional: all DT OPPs start filtered out. */
+	/*
+	 * Preserve existing DT OPPs.  Firmware may provide additional states
+	 * for this silicon bin; register those using the LUT voltage.
+	 */
 	opp = dev_pm_opp_find_freq_exact(cpu_dev, freq, false);
-	if (IS_ERR(opp))
-		return PTR_ERR(opp);
+	if (IS_ERR(opp)) {
+		ret = PTR_ERR(opp);
+		if (ret != -ERANGE)
+			return ret;
+
+		/* A repeated LUT frequency may already have been enabled. */
+		opp = dev_pm_opp_find_freq_exact(cpu_dev, freq, true);
+		if (IS_ERR(opp)) {
+			ret = PTR_ERR(opp);
+			if (ret != -ERANGE)
+				return ret;
+			if (!freq_khz || !volt)
+				return -EINVAL;
+
+			ret = dev_pm_opp_add(cpu_dev, freq, volt);
+			if (!ret)
+				dev_info(cpu_dev,
+					 "added firmware CPU OPP: %u kHz, %u uV\n",
+					 freq_khz, volt);
+			return ret;
+		}
+	}
 	dev_pm_opp_put(opp);
 
 	ret = dev_pm_opp_adjust_voltage(cpu_dev, freq, volt, volt, volt);
