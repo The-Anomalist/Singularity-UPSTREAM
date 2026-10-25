@@ -1173,6 +1173,9 @@ struct oplus_chg_chip {
 	bool otg_switch;
 	bool ui_otg_switch;
 	int mmi_chg;
+	/* Explicit userspace request; preserved across charger detection resets. */
+	bool user_charge_disabled;
+	unsigned int user_charge_resume_retries;
 	int unwakelock_chg;
 	int stop_chg;
 	int mmi_fastchg;
@@ -1520,6 +1523,7 @@ struct oplus_chg_operations {
 	int (*term_current_set)(int cur);
 	int (*charging_enable)(void);
 	int (*charging_disable)(void);
+	int (*set_user_charge_disable)(bool disable);
 	int (*get_charging_enable)(void);
 	int (*charger_suspend)(void);
 	int (*charger_unsuspend)(void);

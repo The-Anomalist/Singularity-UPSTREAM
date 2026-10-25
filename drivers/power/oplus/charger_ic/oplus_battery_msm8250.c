@@ -12776,6 +12776,7 @@ static enum power_supply_property smb5_batt_props[] = {
 	POWER_SUPPLY_PROP_FCC_STEPPER_ENABLE,
 #ifdef OPLUS_FEATURE_CHG_BASIC
 	POWER_SUPPLY_PROP_OP_DISABLE_CHARGE,
+	POWER_SUPPLY_PROP_CHARGING_ENABLED,
 	POWER_SUPPLY_PROP_VOLTAGE_MIN,
 	POWER_SUPPLY_PROP_CHARGE_NOW,
 	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
@@ -12813,10 +12814,17 @@ static int smb5_batt_get_prop(struct power_supply *psy, enum power_supply_proper
 #endif
 
 #ifdef OPLUS_FEATURE_CHG_BASIC
+	case POWER_SUPPLY_PROP_CHARGING_ENABLED:
+		if (!g_oplus_chip)
+			return -ENODEV;
+		val->intval = !READ_ONCE(g_oplus_chip->user_charge_disabled) &&
+			!!READ_ONCE(g_oplus_chip->mmi_chg);
+		break;
 	case POWER_SUPPLY_PROP_OP_DISABLE_CHARGE:
 		if (!g_oplus_chip)
 			return -ENODEV;
-		val->intval = !g_oplus_chip->mmi_chg;
+		val->intval = READ_ONCE(g_oplus_chip->user_charge_disabled) ||
+			!READ_ONCE(g_oplus_chip->mmi_chg);
 		break;
 #endif
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
@@ -12986,10 +12994,13 @@ static int smb5_batt_set_prop(struct power_supply *psy, enum power_supply_proper
 
 	switch (prop) {
 #ifdef OPLUS_FEATURE_CHG_BASIC
+	case POWER_SUPPLY_PROP_CHARGING_ENABLED:
 	case POWER_SUPPLY_PROP_OP_DISABLE_CHARGE:
 		if (val->intval != 0 && val->intval != 1)
 			return -EINVAL;
-		rc = oplus_chg_set_mmi_charging(g_oplus_chip, !val->intval);
+		rc = oplus_chg_set_mmi_charging(g_oplus_chip,
+			prop == POWER_SUPPLY_PROP_CHARGING_ENABLED ?
+			val->intval : !val->intval);
 		if (!rc)
 			power_supply_changed(psy);
 		break;
@@ -13087,6 +13098,7 @@ static int smb5_batt_prop_is_writeable(struct power_supply *psy, enum power_supp
 
 	switch (psp) {
 #ifdef OPLUS_FEATURE_CHG_BASIC
+	case POWER_SUPPLY_PROP_CHARGING_ENABLED:
 	case POWER_SUPPLY_PROP_OP_DISABLE_CHARGE:
 		return 1;
 #endif
@@ -15201,6 +15213,21 @@ static int smbchg_term_current_set(int term_current)
 	return rc;
 }
 
+/* A separate vote prevents normal policy from clearing the user stop. */
+static int smbchg_user_charge_disable(bool disable)
+{
+	struct oplus_chg_chip *chip = g_oplus_chip;
+	struct votable *votable;
+
+	if (!chip || !chip->pmic_spmi.smb5_chip)
+		return -ENODEV;
+	votable = chip->pmic_spmi.smb5_chip->chg.chg_disable_votable;
+	if (IS_ERR_OR_NULL(votable))
+		return -ENODEV;
+
+	return vote(votable, "USER_CHARGE_DISABLE", disable, 0);
+}
+
 static int smbchg_charging_enble(void)
 {
 	int rc = 0;
@@ -15947,6 +15974,7 @@ struct oplus_chg_operations smb5_chg_ops = {
 	.term_current_set = smbchg_term_current_set,
 	.charging_enable = smbchg_charging_enble,
 	.charging_disable = smbchg_charging_disble,
+	.set_user_charge_disable = smbchg_user_charge_disable,
 	.get_charging_enable = smbchg_get_charge_enable,
 	.charger_suspend = smbchg_usb_suspend_enable,
 	.charger_unsuspend = smbchg_usb_suspend_disable,

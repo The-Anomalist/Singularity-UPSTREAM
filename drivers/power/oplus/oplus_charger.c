@@ -3173,7 +3173,7 @@ static void mmi_adapter_in_work_func(struct work_struct *work)
 {
 	struct delayed_work *dwork = to_delayed_work(work);
 	struct oplus_chg_chip *chip = container_of(dwork, struct oplus_chg_chip, mmi_adapter_in_work);
-	chip->mmi_fastchg = 1;
+	chip->mmi_fastchg = !READ_ONCE(chip->user_charge_disabled);
 	charger_xlog_printk(CHG_LOG_CRTI, "clear mmi_fastchg\n");
 	oplus_chg_set_force_psy_changed();
 }
@@ -8093,6 +8093,10 @@ void oplus_chg_variables_reset(struct oplus_chg_chip *chip, bool in)
 	chip->parallel_error_flag &= ~(REASON_SOC_NOT_FULL);
 	chip->soc_not_full_report = false;
 	chip->voocphy_notify_ap_suspend = false;
+	if (READ_ONCE(chip->user_charge_disabled)) {
+		chip->mmi_chg = 0;
+		chip->mmi_fastchg = 0;
+	}
 	chg_err("charger detect is %d\n", in);
 }
 
@@ -8149,6 +8153,8 @@ static void oplus_chg_variables_init(struct oplus_chg_chip *chip)
 	chip->camera_on = 0;
 	chip->stop_voter = 0x00;
 	chip->charging_state = CHARGING_STATUS_CCCV;
+	chip->user_charge_disabled = false;
+	chip->user_charge_resume_retries = 0;
 	chip->mmi_chg = 1;
 	chip->unwakelock_chg = 0;
 	chip->chg_cycle_status = CHG_CYCLE_VOTER__NONE;
@@ -12455,8 +12461,26 @@ static void oplus_parallel_chg_mos_test_work(struct work_struct *work)
 
 static void oplus_chg_reset_adapter_work(struct work_struct *work)
 {
+	struct oplus_chg_chip *chip = g_charger_chip;
+
+	if (!chip)
+		return;
 	oplus_chg_suspend_charger();
 	msleep(1000);
+	/* Restore adapter input without restarting a userspace-stopped charge. */
+	if (!READ_ONCE(chip->mmi_chg) &&
+	    READ_ONCE(chip->user_charge_disabled)) {
+		if (chip->charger_exist && !chip->otg_online &&
+		    chip->stop_chg == 1 && !chip->stop_voter &&
+		    chip->authenticate && chip->hmac &&
+		    !chip->balancing_bat_stop_chg &&
+		    oplus_vooc_get_allow_reading() &&
+		    !oplus_vooc_get_fastchg_started() &&
+		    !oplus_vooc_get_fastchg_ing() &&
+		    !oplus_adsp_voocphy_get_fastchg_start())
+			oplus_chg_unsuspend_charger();
+		return;
+	}
 	if (g_charger_chip->mmi_chg) {
 		if ((oplus_vooc_get_fastchg_ing() == false || oplus_vooc_get_fastchg_dummy_started() ||
 		     oplus_vooc_get_fastchg_to_normal() || oplus_vooc_get_fastchg_to_warm()) &&
@@ -12476,13 +12500,32 @@ static void oplus_chg_reset_adapter_work(struct work_struct *work)
 void oplus_chg_turn_on_charging_in_work(void)
 {
 	if (g_charger_chip)
-		schedule_delayed_work(&g_charger_chip->turn_on_charging_work, 0);
+		mod_delayed_work(system_wq, &g_charger_chip->turn_on_charging_work, 0);
 }
 
 static void oplus_chg_turn_on_charging_work(struct work_struct *work)
 {
-	if (g_charger_chip)
-		oplus_chg_turn_on_charging(g_charger_chip);
+	struct oplus_chg_chip *chip = g_charger_chip;
+
+	if (!chip)
+		return;
+	if (READ_ONCE(chip->user_charge_disabled) || !chip->mmi_chg ||
+	    !chip->charger_exist || chip->otg_online) {
+		chip->user_charge_resume_retries = 0;
+		return;
+	}
+	/* Retry only temporary VOOC bus ownership, for at most 30 seconds. */
+	if (!oplus_vooc_get_allow_reading()) {
+		if (chip->user_charge_resume_retries++ < 30)
+			mod_delayed_work(system_wq, &chip->turn_on_charging_work,
+				msecs_to_jiffies(1000));
+		else
+			chg_err("user charging resume timed out waiting for VOOC\n");
+		return;
+	}
+	chip->user_charge_resume_retries = 0;
+	/* This retains authentication, balancing and thermal policy checks. */
+	oplus_chg_turn_on_charging(chip);
 }
 
 static void oplus_chg_soc_update_when_resume_work(struct work_struct *work)

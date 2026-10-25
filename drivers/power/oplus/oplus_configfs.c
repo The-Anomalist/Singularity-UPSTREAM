@@ -4,6 +4,7 @@
  */
 
 #include <linux/configfs.h>
+#include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/device.h>
 #include <linux/nls.h>
@@ -780,7 +781,9 @@ static ssize_t mmi_charging_enable_show(struct device *dev, struct device_attrib
 }
 
 /* Shared policy for the Oplus toggle and battery/op_disable_charge. */
-int oplus_chg_set_mmi_charging(struct oplus_chg_chip *chip, int val)
+static DEFINE_MUTEX(user_charge_lock);
+
+static int oplus_chg_apply_mmi_charging(struct oplus_chg_chip *chip, int val)
 {
 	int ret = 0;
 
@@ -791,6 +794,8 @@ int oplus_chg_set_mmi_charging(struct oplus_chg_chip *chip, int val)
 
 	chg_err("set mmi_chg = [%d].\n", val);
 	chip->total_time = 0;
+	/* Finish an earlier resume before changing the charging policy. */
+	cancel_delayed_work_sync(&chip->turn_on_charging_work);
 	if (val == 0) {
 		if (chip->unwakelock_chg == 1) {
 			ret = -EINVAL;
@@ -798,9 +803,7 @@ int oplus_chg_set_mmi_charging(struct oplus_chg_chip *chip, int val)
 		} else {
 			oplus_chg_track_upload_mmi_chg_info(chip, 0);
 			chip->mmi_chg = 0;
-			if ((chip->vooc_project) && (oplus_vooc_get_fastchg_started() == true)) {
-				chip->mmi_fastchg = 0;
-			}
+			chip->mmi_fastchg = 0;
 			if (oplus_chg_get_voocphy_support() == ADSP_VOOCPHY) {
 				oplus_adsp_voocphy_turn_off();
 			} else {
@@ -839,6 +842,58 @@ int oplus_chg_set_mmi_charging(struct oplus_chg_chip *chip, int val)
 	}
 
 
+	return ret;
+}
+
+/* Serialize the aliases and keep a durable user vote for SM8250. */
+int oplus_chg_set_mmi_charging(struct oplus_chg_chip *chip, int val)
+{
+	int ret;
+	bool was_disabled;
+
+	if (!chip)
+		return -ENODEV;
+	if (val != 0 && val != 1)
+		return -EINVAL;
+
+	mutex_lock(&user_charge_lock);
+	if (chip->unwakelock_chg == 1) {
+		ret = -EINVAL;
+		goto out;
+	}
+	was_disabled = READ_ONCE(chip->user_charge_disabled);
+	if (!val && chip->chg_ops->set_user_charge_disable) {
+		ret = chip->chg_ops->set_user_charge_disable(true);
+		if (ret < 0)
+			goto out;
+		WRITE_ONCE(chip->user_charge_disabled, true);
+	}
+	chip->user_charge_resume_retries = 0;
+	ret = oplus_chg_apply_mmi_charging(chip, val);
+	if (ret < 0) {
+		if (chip->chg_ops->set_user_charge_disable)
+			chip->chg_ops->set_user_charge_disable(was_disabled);
+		WRITE_ONCE(chip->user_charge_disabled, was_disabled);
+		goto out;
+	}
+	if (val && chip->chg_ops->set_user_charge_disable) {
+		ret = chip->chg_ops->set_user_charge_disable(false);
+		if (ret < 0) {
+			/* Preserve the stop request when releasing its vote fails. */
+			chip->chg_ops->set_user_charge_disable(true);
+			WRITE_ONCE(chip->user_charge_disabled, true);
+			chip->mmi_chg = 0;
+			chip->mmi_fastchg = 0;
+			cancel_delayed_work_sync(&chip->turn_on_charging_work);
+			goto out;
+		}
+		WRITE_ONCE(chip->user_charge_disabled, false);
+		/* Requeue after releasing the vote, even if an earlier run exited. */
+		if (!chip->otg_online)
+			oplus_chg_turn_on_charging_in_work();
+	}
+out:
+	mutex_unlock(&user_charge_lock);
 	return ret;
 }
 
