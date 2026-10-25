@@ -345,11 +345,6 @@ static void a6xx_hwcg_set(struct adreno_device *adreno_dev, bool on)
 		kgsl_regwrite(device, a6xx_core->hwcg[i].offset,
 			on ? a6xx_core->hwcg[i].value : 0);
 
-	/* A650 GBIF L2 clock gating is separate from UCHE clock gating. */
-	if (adreno_is_a650(adreno_dev))
-		kgsl_regrmw(device, A6XX_UCHE_GBIF_GX_CONFIG,
-			0x70000, on ? 2 : 0);
-
 	/*
 	 * Enable SP clock after programming HWCG registers.
 	 * A612 and A610 GPU is not having the GX power domain.
