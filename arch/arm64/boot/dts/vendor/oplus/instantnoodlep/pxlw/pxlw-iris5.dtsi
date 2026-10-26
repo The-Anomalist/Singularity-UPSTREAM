@@ -3,7 +3,7 @@
  * Copyright (c) 2020, Pixelworks
  */
 
-#include "pxlw-iris5-cfg-samsung-wqhd-dsc8-90fps-cmd.dtsi"
+#include "pxlw-iris5-cfg-samsung-wqhd-dsc8-cmd.dtsi"
 
 &tlmm {
 	pxlw_iris_gpio: pxlw_iris_gpio {
@@ -132,7 +132,7 @@
 
 &sde_dsi {
 	px_v18r-supply = <&pm8150_l7>;
-	pxlw,iris-lightup-config = <&mdss_iris_cfg_samsung_oneplus_dsc8_90fps_cmd>;
+	pxlw,iris-lightup-config = <&mdss_iris_cfg_samsung_oneplus_dsc8_cmd>;
 };
 
 &vendor {

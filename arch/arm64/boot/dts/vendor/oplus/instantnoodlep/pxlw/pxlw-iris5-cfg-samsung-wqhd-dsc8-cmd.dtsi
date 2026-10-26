@@ -1,7 +1,7 @@
 /* Fullchip dtype, last, wait, ip, opt, dlen sys */
 &vendor {
 	pxlw {
-		mdss_iris_cfg_samsung_oneplus_dsc8_90fps_cmd: pxlw,mdss_iris_cfg_samsung_oneplus_dsc8_90fps_cmd {
+		mdss_iris_cfg_samsung_oneplus_dsc8_cmd: pxlw,mdss_iris_cfg_samsung_oneplus_dsc8_cmd {
 			pxlw,panel-type = "PANEL_OLED";
 			/* low power control: dynamic power gating, ulps low power, analog bypass */
 			pxlw,low-power = [00 01 01];
@@ -363,81 +363,6 @@
 				23 f0 01
 				/* mipi abyp */
 				01 e1 01
-				/* DMA */
-				11 e1 00
-
-				/* enable mipi */
-				02 03 00
-			];
-
-			// for QHD 90fps switch
-			pxlw,iris-timing-switch-sequence-2 = [
-				/* disable mipi */
-				02 02 01
-
-				/* rx ctrl */
-				01 f0 01
-				/* tx */
-				02 01 01
-				02 00 01
-				/* dtg */
-				05 00 00
-				05 f0 00
-				/* DMA */
-				11 f1 01
-				/* dport */
-				04 f0 01
-				04 80 01
-				/* pwil */
-				03 f0 01
-				03 f1 01
-				03 f2 01
-				03 f3 01
-				03 f4 01
-				03 20 01
-				03 a0 01
-				03 b0 01
-				03 c0 01
-				03 d0 01
-				03 40 01
-				03 80 01
-				/* blending */
-				2e f0 01
-				/* dpp */
-				0e a0 01
-				0e 01 01
-				/* lce */
-				0d f0 01
-				/* scaler1d */
-				0b f0 01
-				0b a0 01
-				/* scaler1d pp */
-				2f f0 01
-				/* psr mif */
-				2d f0 01
-				/* dsc decoder */
-				07 f0 01
-				07 a0 01
-				07 80 01
-				/* dsc encoder */
-				08 f0 01
-				/* pwil */
-				03 61 01
-				03 95 01
-				03 51 01
-				03 23 01
-				/* rx aux */
-				21 f2 01
-				21 f0 01
-				/* dsc aux */
-				37 f0 00
-				/* osd_comp */
-				2a f0 01
-				2b f0 01
-				/* pwil_v6 */
-				23 f0 01
-				/* mipi abyp */
-				01 e0 01
 				/* DMA */
 				11 e1 00
 
