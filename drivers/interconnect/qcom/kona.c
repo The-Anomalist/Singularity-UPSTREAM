@@ -4156,7 +4156,8 @@ static void kona_icc_aggregate_node_clients(struct kona_icc_provider *qp,
 		return;
 
 	list_for_each_entry(client, &qp->client_votes, node) {
-		if (!client->valid || client->index != index)
+		if (!client->valid || client->index != index ||
+		    (!client->avg_bw && !client->peak_bw))
 			continue;
 
 		if (U64_MAX - avg < client->avg_bw)
@@ -4685,6 +4686,26 @@ kona_icc_shadow_cpu_endpoint_vote(struct kona_icc_provider *qp,
 		node_raw_peak = qp->req_ib[i];
 		node_eff_avg = qp->eff_ab[i];
 		node_eff_peak = qp->eff_ib[i];
+
+		if (!active_bucket) {
+			struct kona_icc_client_vote *client;
+
+			/* Filter each client before forming a low-power bucket. */
+			node_raw_avg = 0;
+			node_raw_peak = 0;
+			list_for_each_entry(client, &qp->client_votes, node) {
+				if (!client->valid || client->index != i ||
+				    !(kona_icc_client_effective_tag(client->tag) &
+				      BIT(bucket)))
+					continue;
+				kona_icc_add_cpu_ab(&node_raw_avg, client->avg_bw);
+				node_raw_peak = max(node_raw_peak, client->peak_bw);
+			}
+			node_raw_avg = min_t(u64, node_raw_avg,
+					     KONA_ICC_MAX_LOGICAL_VOTE);
+			node_raw_peak = min_t(u64, node_raw_peak,
+					      KONA_ICC_MAX_LOGICAL_VOTE);
+		}
 
 		if (node_raw_avg == U64_MAX ||
 		    node_raw_peak == U64_MAX)
@@ -6095,7 +6116,7 @@ static u32 kona_icc_modern_ws_mask(struct kona_icc_provider *qp)
  * Stage 10 + 11 controlled ownership.
  *
  * ACTIVE:
- *   invalidate previous cached RPMh transaction state
+ *   preserve shared cached transactions unless rebuilding WAKE/SLEEP
  *   submit RAW candidate AMC transaction immediately
  *
  * WAKE/SLEEP:
@@ -6121,12 +6142,14 @@ static int kona_icc_modern_hw_commit(struct kona_icc_provider *qp)
 	struct kona_shadow_tcs_batch wake_batch, sleep_batch;
 	struct kona_shadow_payload_set wake_set, sleep_set;
 	u32 ws_mask;
+	bool ws_enabled;
 	int ret = 0;
 
 	if (!qp || !READ_ONCE(kona_modern_hw_active_enable))
 		return 0;
 
 	mutex_lock(&kona_modern_hw_lock);
+	ws_enabled = READ_ONCE(kona_modern_hw_ws_enable);
 
 	/*
 	 * First activation must synchronize the complete candidate AMC state.
@@ -6136,7 +6159,7 @@ static int kona_icc_modern_hw_commit(struct kona_icc_provider *qp)
 	 * because rpmh_invalidate() must be followed by a coherent recache.
 	 */
 	if (!qp->modern_hw_active_synced ||
-	    (READ_ONCE(kona_modern_hw_ws_enable) &&
+	    (ws_enabled &&
 	     !qp->modern_hw_ws_synced))
 		active = &qp->raw_state_payloads[KONA_SHADOW_BUCKET_AMC];
 	else
@@ -6147,9 +6170,12 @@ static int kona_icc_modern_hw_commit(struct kona_icc_provider *qp)
 		goto out;
 	}
 
-	ret = rpmh_invalidate(qp->rpmh_dev);
-	if (ret)
-		goto fail;
+	/* Preserve shared cached batches unless rebuilding WAKE/SLEEP. */
+	if (ws_enabled) {
+		ret = rpmh_invalidate(qp->rpmh_dev);
+		if (ret)
+			goto fail;
+	}
 
 	ret = kona_icc_modern_submit_payload_set(
 		qp, RPMH_ACTIVE_ONLY_STATE, active);
@@ -6166,7 +6192,7 @@ static int kona_icc_modern_hw_commit(struct kona_icc_provider *qp)
 	 * therefore rebuild the complete WAKE/SLEEP delta set after every AMC
 	 * commit while WS ownership is enabled.
 	 */
-	if (!READ_ONCE(kona_modern_hw_ws_enable)) {
+	if (!ws_enabled) {
 		qp->modern_hw_ws_synced = false;
 		goto out;
 	}
@@ -6583,6 +6609,10 @@ static void kona_icc_cpu_afm_evaluate(struct kona_icc_provider *qp,
 	    activity == state->last_activity) {
 		*afm_avg = state->proposed_avg;
 		*afm_peak = state->proposed_peak;
+		if (time_before(jiffies, state->hold_until)) {
+			*afm_avg = max(*afm_avg, state->held_avg);
+			*afm_peak = max(*afm_peak, state->held_peak);
+		}
 		return;
 	}
 
@@ -6720,6 +6750,12 @@ static void kona_icc_cpu_afm_evaluate(struct kona_icc_provider *qp,
 	state->last_hold_ms = hold_ms;
 	state->proposed_avg = target_avg;
 	state->proposed_peak = target_peak;
+
+	/* Keep lower proposals pending until the existing hold expires. */
+	if (time_before(jiffies, state->hold_until)) {
+		*afm_avg = max(target_avg, state->held_avg);
+		*afm_peak = max(target_peak, state->held_peak);
+	}
 
 	if (target_avg != raw_avg || target_peak != raw_peak)
 		state->shaped++;
@@ -9835,9 +9871,21 @@ static void kona_icc_release(struct icc_path *path)
 		struct kona_icc_provider *qp = client->qp;
 
 		if (qp) {
+			int ret = 0;
+
 			mutex_lock(&qp->vote_lock);
-			if (!list_empty(&client->node))
+			if (!list_empty(&client->node)) {
 				list_del_init(&client->node);
+				/* Rebuild the node from its remaining consumers. */
+				if (client->valid &&
+				    (client->avg_bw || client->peak_bw))
+					ret = __kona_icc_set(path, 0, 0);
+			}
+			if (ret) {
+				kona_icc_mark_dirty(qp, client->index);
+				kona_icc_queue_replay(qp, KONA_RETRY_DELAY_MS,
+						      "client-release");
+			}
 			mutex_unlock(&qp->vote_lock);
 		}
 
