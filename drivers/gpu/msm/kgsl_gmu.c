@@ -109,7 +109,6 @@ static int gmu_icc_bw_table_init(struct gmu_device *gmu,
 	int ab_count, ib_count;
 	u32 *ab, *ib;
 	int ret;
-	unsigned int i;
 
 	gmu->num_icc_bwlevels = 0;
 	gmu->icc_ab_mbytes = NULL;
@@ -140,10 +139,7 @@ static int gmu_icc_bw_table_init(struct gmu_device *gmu,
 	if (ret)
 		return ret;
 
-	for (i = 0; i < ab_count; i++) {
-		ab[i] = div_u64((u64)ab[i], 1000ULL);
-		ib[i] = div_u64((u64)ib[i], 1000ULL);
-	}
+	/* DT values already use the kB/s units expected by icc_set_bw(). */
 
 	gmu->icc_ab_mbytes = ab;
 	gmu->icc_ib_mbytes = ib;

@@ -79,7 +79,6 @@ static int kgsl_icc_bw_table_init(struct device *dev,
 	int ab_count, ib_count;
 	u32 *ab, *ib;
 	int ret;
-	unsigned int i;
 
 	*num_levels = 0;
 	*ab_tbl = NULL;
@@ -110,10 +109,7 @@ static int kgsl_icc_bw_table_init(struct device *dev,
 	if (ret)
 		return ret;
 
-	for (i = 0; i < ab_count; i++) {
-		ab[i] = div_u64((u64)ab[i], 1000ULL);
-		ib[i] = div_u64((u64)ib[i], 1000ULL);
-	}
+	/* DT values already use the kB/s units expected by icc_set_bw(). */
 
 	*ab_tbl = ab;
 	*ib_tbl = ib;
@@ -132,8 +128,6 @@ static int kgsl_icc_bw_table_from_msm_bus(struct device *dev,
 	u32 *ab, *ib;
 	unsigned int i;
 
-	*num_levels = 0;
-
 	if (!bus_scale_table || !bus_scale_table->num_usecases)
 		return 0;
 
@@ -145,6 +139,8 @@ static int kgsl_icc_bw_table_from_msm_bus(struct device *dev,
 	 */
 	if (*ab_tbl || *ib_tbl)
 		return 0;
+
+	*num_levels = 0;
 
 	ab = devm_kcalloc(dev, bus_scale_table->num_usecases, sizeof(*ab),
 			GFP_KERNEL);
