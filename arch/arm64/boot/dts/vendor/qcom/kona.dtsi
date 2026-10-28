@@ -385,7 +385,6 @@
 		opp-2649600000 { opp-hz = /bits/ 64 <2649600000>; };
 		opp-2745600000 { opp-hz = /bits/ 64 <2745600000>; };
 		opp-2841600000 { opp-hz = /bits/ 64 <2841600000>; };
-		opp-2956800000 { opp-hz = /bits/ 64 <2956800000>; };
 	};
 
 
@@ -418,9 +417,6 @@
 
 			qcom,lut-row-size = <4>;
 			qcom,skip-enable-check;
-			/* Experimental Prime OC; driver validates the stock LUT first. */
-			qcom,prime-oc-domain-id = <2>;
-			qcom,prime-oc-frequency-khz = <2956800>;
 
 			interrupts = <GIC_SPI 30 IRQ_TYPE_LEVEL_HIGH>,
 				     <GIC_SPI 31 IRQ_TYPE_LEVEL_HIGH>,
@@ -1451,8 +1447,7 @@
 				< 1689600 1228800000 >,
 				< 1804800 1305600000 >,
 				< 2227200 1382400000 >,
-				< 2841600 1382400000 >,
-				< 2956800 1382400000 >;
+				< 2841600 1382400000 >;
 		};
 
 		cpu4_cpu_llcc_latmon: qcom,cpu4-cpu-llcc-latmon {
@@ -1468,8 +1463,7 @@
 				< 1804800 MHZ_TO_MBPS(  806, 16) >,
 				< 2227200 MHZ_TO_MBPS(  933, 16) >,
 				< 2476800 MHZ_TO_MBPS( 1100, 16) >,
-				< 2841600 MHZ_TO_MBPS( 1200, 16) >,
-				< 2956800 MHZ_TO_MBPS( 1200, 16) >;
+				< 2841600 MHZ_TO_MBPS( 1200, 16) >;
 		};
 
 		cpu4_llcc_ddr_latmon: qcom,cpu4-llcc-ddr-latmon {
@@ -1492,8 +1486,7 @@
 					< 2380800 MHZ_TO_MBPS(2092, 4) >,
 					< 2500000 MHZ_TO_MBPS(2092, 4) >,
 					< 2525000 MHZ_TO_MBPS(2092, 4) >,
-					< 2841600 MHZ_TO_MBPS(2092, 4) >,
-					< 2956800 MHZ_TO_MBPS(2092, 4) >;
+					< 2841600 MHZ_TO_MBPS(2092, 4) >;
 			};
 
 			ddr5-map {
@@ -1511,8 +1504,7 @@
 					< 2380800 MHZ_TO_MBPS(2368, 4) >,
 					< 2476800 MHZ_TO_MBPS(2736, 4) >,
 					< 2525000 MHZ_TO_MBPS(2736, 4) >,
-					< 2841600 MHZ_TO_MBPS(2736, 4) >,
-					< 2956800 MHZ_TO_MBPS(2736, 4) >;
+					< 2841600 MHZ_TO_MBPS(2736, 4) >;
 			};
 		};
 
@@ -1526,8 +1518,7 @@
 					< 2380800 MHZ_TO_MBPS(1017, 4) >,
 					< 2500000 MHZ_TO_MBPS(1804, 4) >,
 					< 2525000 MHZ_TO_MBPS(2092, 4) >,
-					< 2841600 MHZ_TO_MBPS(2092, 4) >,
-					< 2956800 MHZ_TO_MBPS(2092, 4) >;
+					< 2841600 MHZ_TO_MBPS(2092, 4) >;
 			};
 
 			ddr5-map {
@@ -1537,8 +1528,7 @@
 					< 2380800 MHZ_TO_MBPS(1017, 4) >,
 					< 2500000 MHZ_TO_MBPS(2368, 4) >,
 					< 2525000 MHZ_TO_MBPS(2736, 4) >,
-					< 2841600 MHZ_TO_MBPS(2736, 4) >,
-					< 2956800 MHZ_TO_MBPS(2736, 4) >;
+					< 2841600 MHZ_TO_MBPS(2736, 4) >;
 			};
 		};
 
