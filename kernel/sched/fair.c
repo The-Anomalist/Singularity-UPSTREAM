@@ -7060,7 +7060,7 @@ static void find_best_target(struct sched_domain *sd, cpumask_t *cpus,
 	 * performance CPU, thus requiring to maximise target_capacity. In this
 	 * case we initialise target_capacity to 0.
 	 */
-	prefer_idle = uclass_pick_idle_cpu_first(p);
+	prefer_idle |= uclass_pick_idle_cpu_first(p);
 	boosted = fbt_env->boosted || uclamp_boosted(p);
 	if (prefer_idle && boosted)
 		target_capacity = 0;
@@ -7689,7 +7689,8 @@ static void select_cpu_candidates(struct sched_domain *sd, cpumask_t *cpus,
 {
 	int highest_spare_cap_cpu = -1, best_idle_cpu = -1;
 	unsigned long spare_cap, max_spare_cap, util, cpu_cap;
-	bool prefer_idle = uclass_pick_idle_cpu_first(p);
+	bool prefer_idle = uclamp_latency_sensitive(p) ||
+			   uclass_pick_idle_cpu_first(p);
 	bool boosted = uclamp_boosted(p);
 	unsigned long target_cap = boosted ? 0 : ULONG_MAX;
 	unsigned long highest_spare_cap = 0;

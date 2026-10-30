@@ -265,14 +265,19 @@ static void sugov_fast_switch(struct sugov_policy *sg_policy, u64 time,
 {
 	struct cpufreq_policy *policy = sg_policy->policy;
 	unsigned int cpu;
+	unsigned int prev_freq = sg_policy->next_freq;
 
 	if (!sugov_update_next_freq(sg_policy, time, next_freq))
 		return;
 
 	sugov_track_cycles(sg_policy, sg_policy->policy->cur, time);
 	next_freq = cpufreq_driver_fast_switch(policy, next_freq);
-	if (!next_freq)
+	if (!next_freq) {
+		/* A rejected request must remain eligible for a later retry. */
+		sg_policy->next_freq = prev_freq;
+		sg_policy->need_freq_update = true;
 		return;
+	}
 
 	policy->cur = next_freq;
 
