@@ -400,14 +400,15 @@ static unsigned int qcom_cpufreq_hw_programmed_index(struct cpufreq_qcom *c,
 }
 
 static int
-qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
-			     unsigned int index)
+qcom_cpufreq_hw_set_index(struct cpufreq_policy *policy,
+			  unsigned int index, bool *accepted)
 {
 	struct cpufreq_qcom *c = policy->driver_data;
 	unsigned int actual_freq, curr_freq, curr_index, programmed_index;
 	unsigned long flags;
 	u64 now;
 	bool rate_limited = false;
+	bool filtered = false;
 	bool update_scale = false;
 	bool reuse_curr_freq = false;
 	bool thermal_switch;
@@ -433,6 +434,7 @@ qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 		spin_lock_irqsave(&c->transition_lock, flags);
 		c->filtered_hyst_transitions++;
 		spin_unlock_irqrestore(&c->transition_lock, flags);
+		filtered = true;
 		goto update_scale;
 	}
 
@@ -448,8 +450,10 @@ qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 			c->blocked_down_transitions++;
 	}
 	spin_unlock_irqrestore(&c->transition_lock, flags);
-	if (rate_limited)
+	if (rate_limited) {
+		filtered = true;
 		goto update_scale;
+	}
 
 	if (c->skip_data.skip && index == c->skip_data.high_temp_index) {
 		spin_lock_irqsave(&c->skip_data.lock, flags);
@@ -485,7 +489,18 @@ update_scale:
 		arch_set_freq_scale(policy->related_cpus, actual_freq,
 				    policy->cpuinfo.max_freq);
 
+	if (accepted)
+		*accepted = !filtered;
+
 	return 0;
+}
+
+static int
+qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
+			     unsigned int index)
+{
+	/* Preserve the slow-path and thermal callers' existing return contract. */
+	return qcom_cpufreq_hw_set_index(policy, index, NULL);
 }
 
 static unsigned int qcom_cpufreq_hw_get(unsigned int cpu)
@@ -515,14 +530,16 @@ qcom_cpufreq_hw_fast_switch(struct cpufreq_policy *policy,
 			    unsigned int target_freq)
 {
 	int index;
+	bool accepted;
 
 	index = policy->cached_resolved_idx;
 	if (index < 0)
 		return 0;
 
-	if (qcom_cpufreq_hw_target_index(policy, index))
+	if (qcom_cpufreq_hw_set_index(policy, index, &accepted) || !accepted)
 		return 0;
 
+	/* Clock settling or thermal limits do not mean the request was rejected. */
 	return qcom_cpufreq_hw_get(policy->cpu);
 }
 
