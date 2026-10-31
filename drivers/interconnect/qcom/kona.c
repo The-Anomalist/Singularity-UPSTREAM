@@ -49,20 +49,23 @@
 /*
  * Modern RPMh ownership gates.
  *
- * ACTIVE is the default CPU fabric owner. WAKE/SLEEP remains opt-in
- * until a non-zero suspend transaction has been validated.
+ * CPU bandwidth belongs to the shared msm_bus aggregator. These
+ * experimental direct-write gates cannot take ownership in this build.
  */
-static bool kona_modern_hw_active_enable = true;
+/* CPU demand joins msm_bus; independent shared-BCM writes are unsafe. */
+#define KONA_CPU_MSM_BUS_OWNER 1
+
+static bool kona_modern_hw_active_enable;
 module_param_named(modern_hw_active_enable,
-		   kona_modern_hw_active_enable, bool, 0644);
+		   kona_modern_hw_active_enable, bool, 0444);
 MODULE_PARM_DESC(modern_hw_active_enable,
-		 "Enable RAW modern Kona ACTIVE RPMh voting");
+		 "Reserved direct ACTIVE gate; shared msm_bus owns CPU bandwidth");
 
 static bool kona_modern_hw_ws_enable;
 module_param_named(modern_hw_ws_enable,
-		   kona_modern_hw_ws_enable, bool, 0644);
+		   kona_modern_hw_ws_enable, bool, 0444);
 MODULE_PARM_DESC(modern_hw_ws_enable,
-		 "Enable RAW modern Kona WAKE/SLEEP RPMh voting");
+		 "Reserved direct WAKE/SLEEP gate; shared msm_bus owns CPU bandwidth");
 
 static DEFINE_MUTEX(kona_modern_hw_lock);
 
@@ -1296,6 +1299,10 @@ struct kona_cpu_afm_state {
 struct kona_icc_provider {
 	struct icc_provider provider;
 	struct device *rpmh_dev;
+	struct msm_bus_client_handle **cpu_bus_clients;
+	u64 cpu_bus_submissions;
+	u64 cpu_bus_failures;
+	int cpu_bus_last_error;
 	const struct kona_icc_node_desc *nodes;
 	size_t num_nodes;
 
@@ -1423,6 +1430,7 @@ struct kona_icc_provider {
 
 	/* Adaptive CPU fabric policy state. */
 	struct kona_cpu_afm_state cpu_afm;
+	struct kona_cpu_afm_state cpu_mem_afm;
 
 	bool boot_floor_vote;
 	bool first_cpu_request_seen;
@@ -1499,6 +1507,7 @@ struct kona_icc_provider {
 	 * Guarantee that residency expires even when no new ICC callback arrives.
 	 */
 	struct delayed_work cpu_afm_work;
+	struct delayed_work cpu_mem_afm_work;
 
 	unsigned long cpu_downvote_deadline;
 	bool cpu_downvote_expired;
@@ -4624,6 +4633,7 @@ static bool kona_icc_cpu_to_memory(u32 id);
 static bool kona_icc_cpu_generic(u32 id);
 static void kona_icc_add_cpu_ab(u64 *total, u64 vote);
 static void kona_icc_cpu_afm_evaluate(struct kona_icc_provider *qp,
+				      bool memory,
 				      u64 raw_avg, u64 raw_peak,
 				      u64 activity,
 				      u64 *afm_avg, u64 *afm_peak);
@@ -5220,7 +5230,7 @@ static void kona_icc_refresh_raw_shadow_buckets(struct kona_icc_provider *qp)
 		    (cpu_fabric_avg || cpu_fabric_peak)) {
 			u64 afm_avg, afm_peak;
 
-			kona_icc_cpu_afm_evaluate(qp,
+			kona_icc_cpu_afm_evaluate(qp, false,
 						  cpu_fabric_avg,
 						  cpu_fabric_peak,
 						  activity,
@@ -5231,17 +5241,10 @@ static void kona_icc_refresh_raw_shadow_buckets(struct kona_icc_provider *qp)
 				max(cpu_fabric_avg, afm_avg);
 			cpu_fabric_peak =
 				max(cpu_fabric_peak, afm_peak);
-
-			if (cpu_mem_avg || cpu_mem_peak) {
-				cpu_mem_avg =
-					max(cpu_mem_avg, afm_avg);
-				cpu_mem_peak =
-					max(cpu_mem_peak, afm_peak);
-			}
 		} else if (bucket == KONA_SHADOW_BUCKET_AMC) {
 			u64 afm_avg, afm_peak;
 
-			kona_icc_cpu_afm_evaluate(qp, 0, 0, 0,
+			kona_icc_cpu_afm_evaluate(qp, false, 0, 0, 0,
 						  &afm_avg, &afm_peak);
 
 			if (afm_avg || afm_peak) {
@@ -5250,6 +5253,21 @@ static void kona_icc_refresh_raw_shadow_buckets(struct kona_icc_provider *qp)
 				cpu_fabric_peak =
 					max(cpu_fabric_peak, afm_peak);
 			}
+		}
+
+		if (bucket == KONA_SHADOW_BUCKET_AMC) {
+			u64 afm_avg, afm_peak;
+
+			/* DDR demand and residency are independent of LLCC traffic. */
+			kona_icc_cpu_afm_evaluate(qp, true,
+						  cpu_mem_avg, cpu_mem_peak,
+						  mem_activity,
+						  &afm_avg, &afm_peak);
+			cpu_mem_avg = max(cpu_mem_avg, afm_avg);
+			cpu_mem_peak = max(cpu_mem_peak, afm_peak);
+			/* Retained DDR traffic must also traverse the CPU fabric. */
+			cpu_fabric_avg = max(cpu_fabric_avg, cpu_mem_avg);
+			cpu_fabric_peak = max(cpu_fabric_peak, cpu_mem_peak);
 		}
 
 		kona_icc_shadow_storage_contribution(
@@ -6082,7 +6100,9 @@ kona_icc_modern_submit_payload_set(struct kona_icc_provider *qp,
 
 			cmds[cmd].addr = entry->addr;
 			cmds[cmd].data = entry->data;
-			cmds[cmd].wait = 0;
+			/* Wait for each ACTIVE VCD commit before returning. */
+			cmds[cmd].wait = state == RPMH_ACTIVE_ONLY_STATE &&
+					 entry->commit;
 			cmd++;
 		}
 	}
@@ -6132,7 +6152,8 @@ static bool kona_icc_modern_cpu_authoritative(struct kona_icc_provider *qp)
 	if (!qp)
 		return false;
 
-	return READ_ONCE(kona_modern_hw_active_enable) &&
+	return !KONA_CPU_MSM_BUS_OWNER &&
+	       READ_ONCE(kona_modern_hw_active_enable) &&
 	       READ_ONCE(qp->modern_hw_active_synced);
 }
 
@@ -6145,10 +6166,18 @@ static int kona_icc_modern_hw_commit(struct kona_icc_provider *qp)
 	bool ws_enabled;
 	int ret = 0;
 
-	if (!qp || !READ_ONCE(kona_modern_hw_active_enable))
+	if (KONA_CPU_MSM_BUS_OWNER ||
+	    !qp || !READ_ONCE(kona_modern_hw_active_enable))
 		return 0;
 
 	mutex_lock(&kona_modern_hw_lock);
+	if (READ_ONCE(qp->system_suspended) ||
+	    atomic_read(&qp->votes_paused)) {
+		/* A deferred transaction needs a full replay after unpausing. */
+		qp->modern_hw_active_synced = false;
+		qp->modern_hw_ws_synced = false;
+		goto out;
+	}
 	ws_enabled = READ_ONCE(kona_modern_hw_ws_enable);
 
 	/*
@@ -6475,6 +6504,58 @@ static bool kona_icc_cpu_to_memory(u32 id)
 		 !(id & 1));
 }
 
+static void kona_icc_cpu_bus_unregister(void *data)
+{
+	msm_bus_scale_unregister(data);
+}
+
+/* Caller holds vote_lock and has passed the suspend/programming guard. */
+static int kona_icc_cpu_bus_vote(struct kona_icc_provider *qp,
+				 unsigned int index, u64 ab, u64 ib)
+{
+	struct msm_bus_client_handle *client = qp->cpu_bus_clients[index];
+	char *name = (char *)qp->nodes[index].name;
+	bool memory = kona_icc_cpu_to_memory(qp->nodes[index].id);
+	u32 master = memory ? MSM_BUS_MASTER_LLCC : MSM_BUS_MASTER_AMPSS_M0;
+	u32 slave = memory ? MSM_BUS_SLAVE_EBI_CH0 : MSM_BUS_SLAVE_LLCC;
+	int ret;
+
+	if (ab > U64_MAX / 1000 || ib > U64_MAX / 1000) {
+		ret = -ERANGE;
+		goto out;
+	}
+
+	if (!client) {
+		/* Match the native CPU devbw paths: CPU traffic is ACTIVE-only. */
+		client = msm_bus_scale_register(master, slave, name, true);
+		if (IS_ERR_OR_NULL(client)) {
+			ret = client ? PTR_ERR(client) : -EAGAIN;
+			if (ret == -EPROBE_DEFER)
+				ret = -EAGAIN;
+			goto out;
+		}
+		ret = devm_add_action_or_reset(qp->provider.dev,
+					       kona_icc_cpu_bus_unregister, client);
+		if (ret)
+			goto out;
+		qp->cpu_bus_clients[index] = client;
+	}
+
+	/* ICC uses decimal kB/s; msm_bus expects bytes/s. */
+	ret = msm_bus_scale_update_bw(client, ab * 1000, ib * 1000);
+	if (!ret) {
+		qp->last_ab[index] = ab;
+		qp->last_ib[index] = ib;
+	}
+out:
+	qp->cpu_bus_last_error = ret;
+	if (ret)
+		qp->cpu_bus_failures++;
+	else
+		qp->cpu_bus_submissions++;
+	return ret;
+}
+
 static bool kona_icc_cpu_generic(u32 id)
 {
 	return id == KONA_ICC_CPU_TO_LLCC || id == KONA_ICC_CPU_TO_MEM;
@@ -6517,11 +6598,15 @@ static u32 kona_afm_normalized_delta(u64 delta, u64 reference)
 }
 
 static void kona_icc_cpu_afm_evaluate(struct kona_icc_provider *qp,
+				      bool memory,
 				      u64 raw_avg, u64 raw_peak,
 				      u64 activity,
 				      u64 *afm_avg, u64 *afm_peak)
 {
-	struct kona_cpu_afm_state *state = &qp->cpu_afm;
+	struct kona_cpu_afm_state *state = memory ?
+		&qp->cpu_mem_afm : &qp->cpu_afm;
+	struct delayed_work *expiry_work = memory ?
+		&qp->cpu_mem_afm_work : &qp->cpu_afm_work;
 	u64 previous = state->last_activity;
 	u64 history = state->activity_ewma;
 	u64 accel = 0;
@@ -6709,7 +6794,7 @@ static void kona_icc_cpu_afm_evaluate(struct kona_icc_provider *qp,
 		state->held_peak = target_peak;
 		state->hold_until =
 			jiffies + msecs_to_jiffies(hold_ms);
-		mod_delayed_work(system_wq, &qp->cpu_afm_work,
+		mod_delayed_work(system_wq, expiry_work,
 				 msecs_to_jiffies(hold_ms));
 	} else if (time_after_eq(jiffies, state->hold_until)) {
 		/*
@@ -6720,7 +6805,7 @@ static void kona_icc_cpu_afm_evaluate(struct kona_icc_provider *qp,
 		state->held_peak = target_peak;
 		state->hold_until =
 			jiffies + msecs_to_jiffies(hold_ms);
-		mod_delayed_work(system_wq, &qp->cpu_afm_work,
+		mod_delayed_work(system_wq, expiry_work,
 				 msecs_to_jiffies(hold_ms));
 	} else if (target_avg > state->held_avg ||
 		   target_peak > state->held_peak) {
@@ -6732,7 +6817,7 @@ static void kona_icc_cpu_afm_evaluate(struct kona_icc_provider *qp,
 		state->held_peak = max(state->held_peak, target_peak);
 		state->hold_until =
 			jiffies + msecs_to_jiffies(hold_ms);
-		mod_delayed_work(system_wq, &qp->cpu_afm_work,
+		mod_delayed_work(system_wq, expiry_work,
 				 msecs_to_jiffies(hold_ms));
 	}
 
@@ -7486,7 +7571,8 @@ static int kona_icc_commit_cpu_bcms(struct kona_icc_provider *qp,
 	if (READ_ONCE(kona_packed_dry_run) || !num_cmds)
 		goto update_legacy_cache;
 
-	if (kona_cpu_model_stage() < 4 ||
+	if (KONA_CPU_MSM_BUS_OWNER ||
+	    kona_cpu_model_stage() < 4 ||
 	    !READ_ONCE(kona_packed_runtime_enable) ||
 	    !READ_ONCE(kona_packed_group_mask) || qp->packed_fallback_active)
 		return -EPERM;
@@ -7669,7 +7755,8 @@ static int kona_icc_process_packed_aggregate(struct kona_icc_provider *qp,
 	if (skip_legacy)
 		*skip_legacy = false;
 
-	if (kona_cpu_model_stage() < 4 ||
+	if (KONA_CPU_MSM_BUS_OWNER ||
+	    kona_cpu_model_stage() < 4 ||
 	    !READ_ONCE(kona_packed_runtime_enable) ||
 	    !READ_ONCE(kona_packed_group_mask) ||
 	    qp->packed_fallback_active)
@@ -7799,6 +7886,10 @@ static int kona_icc_send_node_votes(struct kona_icc_provider *qp,
 		*retry = false;
 	if (missing_alias)
 		*missing_alias = false;
+
+	/* Each logical CPU node is one client of the common physical voter. */
+	if (KONA_CPU_MSM_BUS_OWNER && kona_icc_is_cpu_memory_path(desc))
+		return kona_icc_cpu_bus_vote(qp, index, ab, ib);
 
 	/* Program the aggregate for a BCM, rather than this node's last vote. */
 	if (kona_vote_debug_submit)
@@ -7955,6 +8046,9 @@ static bool kona_icc_vote_is_unchanged(struct kona_icc_provider *qp,
 
 	if (!qp->last_ab || !qp->last_ib)
 		return false;
+	if (KONA_CPU_MSM_BUS_OWNER &&
+	    kona_icc_is_cpu_memory_path(&qp->nodes[index]))
+		return qp->last_ab[index] == ab && qp->last_ib[index] == ib;
 	if (kona_cpu_model_stage() >= 4 &&
 	    kona_icc_is_cpu_memory_path(&qp->nodes[index]))
 		return false;
@@ -8327,6 +8421,25 @@ static void kona_icc_cpu_afm_workfn(struct work_struct *work)
 	mutex_unlock(&qp->vote_lock);
 }
 
+static void kona_icc_cpu_mem_afm_workfn(struct work_struct *work)
+{
+	struct kona_icc_provider *qp =
+		container_of(to_delayed_work(work), struct kona_icc_provider,
+			     cpu_mem_afm_work);
+
+	if (READ_ONCE(qp->system_suspended) ||
+	    atomic_read(&qp->votes_paused))
+		return;
+
+	mutex_lock(&qp->vote_lock);
+
+	if (!READ_ONCE(qp->system_suspended) &&
+	    !atomic_read(&qp->votes_paused))
+		kona_icc_refresh_bcm_shadow(qp);
+
+	mutex_unlock(&qp->vote_lock);
+}
+
 static void kona_icc_resume_floor_workfn(struct work_struct *work)
 {
 	struct kona_icc_provider *qp =
@@ -8388,6 +8501,15 @@ static void kona_icc_retry_workfn(struct work_struct *work)
 
 	atomic_inc(&qp->replay_runs);
 	mutex_lock(&qp->vote_lock);
+	if (!kona_icc_can_program(qp, &reason)) {
+		mutex_unlock(&qp->vote_lock);
+		kona_icc_queue_replay(qp, 50, reason);
+		return;
+	}
+	/* Restore modern CPU state before compatibility replay can bypass it. */
+	if (READ_ONCE(kona_modern_hw_active_enable) &&
+	    !READ_ONCE(qp->modern_hw_active_synced))
+		kona_icc_refresh_bcm_shadow(qp);
 	need_retry = kona_icc_replay_req_votes_phased(qp);
 	mutex_unlock(&qp->vote_lock);
 
@@ -9253,6 +9375,12 @@ static int kona_param_get_cpu_bcm_stats(char *buffer,
 		(unsigned long long)qp->cpu_afm.proposed_peak);
 
 	len += scnprintf(buffer + len, PAGE_SIZE - len,
+		"cpu_bus owner=msm_bus active_only=1 submissions=%llu failures=%llu last_error=%d\n",
+		(unsigned long long)qp->cpu_bus_submissions,
+		(unsigned long long)qp->cpu_bus_failures,
+		qp->cpu_bus_last_error);
+
+	len += scnprintf(buffer + len, PAGE_SIZE - len,
 		"modern_hw active_enable=%u ws_enable=%u "
 		"active_synced=%u ws_synced=%u "
 		"active_submissions=%llu ws_submissions=%llu "
@@ -9909,6 +10037,9 @@ static void kona_icc_invalidate_cache(struct kona_icc_provider *qp)
 		if (qp->last_ib)
 			qp->last_ib[i] = U64_MAX;
 	}
+	/* Modern synchronization is also invalid across a resume epoch. */
+	qp->modern_hw_active_synced = false;
+	qp->modern_hw_ws_synced = false;
 	kona_icc_mark_all_dirty(qp);
 
 #ifdef CONFIG_INTERCONNECT_QCOM_KONA_PERF_FLOOR
@@ -10004,6 +10135,7 @@ static int kona_icc_suspend(struct device *dev)
 	cancel_delayed_work_sync(&qp->resume_floor_work);
 	cancel_delayed_work_sync(&qp->cpu_downvote_work);
 	cancel_delayed_work_sync(&qp->cpu_afm_work);
+	cancel_delayed_work_sync(&qp->cpu_mem_afm_work);
 
 	mutex_lock(&qp->vote_lock);
 	qp->resume_floor_deadline = 0;
@@ -10021,6 +10153,15 @@ static int kona_icc_suspend(struct device *dev)
 	qp->cpu_afm.last_peak = 0;
 	qp->cpu_afm.last_activity = 0;
 	qp->cpu_afm.hold_until = 0;
+
+	qp->cpu_mem_afm.held_avg = 0;
+	qp->cpu_mem_afm.held_peak = 0;
+	qp->cpu_mem_afm.proposed_avg = 0;
+	qp->cpu_mem_afm.proposed_peak = 0;
+	qp->cpu_mem_afm.last_avg = 0;
+	qp->cpu_mem_afm.last_peak = 0;
+	qp->cpu_mem_afm.last_activity = 0;
+	qp->cpu_mem_afm.hold_until = 0;
 	mutex_unlock(&qp->vote_lock);
 	/* Ensure no stale vote replays fire during suspend/idle windows. */
 	cancel_delayed_work_sync(&qp->retry_work);
@@ -10234,6 +10375,12 @@ static int kona_icc_probe(struct platform_device *pdev)
 	if (!qp->eff_ib)
 		return -ENOMEM;
 
+	qp->cpu_bus_clients = devm_kcalloc(&pdev->dev, qp->num_nodes,
+					   sizeof(*qp->cpu_bus_clients),
+					   GFP_KERNEL);
+	if (!qp->cpu_bus_clients)
+		return -ENOMEM;
+
 	qp->saved_ab = devm_kcalloc(&pdev->dev, qp->num_nodes, sizeof(u64),
 				  GFP_KERNEL);
 	if (!qp->saved_ab)
@@ -10271,6 +10418,8 @@ static int kona_icc_probe(struct platform_device *pdev)
 			  kona_icc_cpu_downvote_workfn);
 	INIT_DELAYED_WORK(&qp->cpu_afm_work,
 			  kona_icc_cpu_afm_workfn);
+	INIT_DELAYED_WORK(&qp->cpu_mem_afm_work,
+			  kona_icc_cpu_mem_afm_workfn);
 	/* Use phased replay only after resume(); steady-state retries stay immediate. */
 	qp->resume_phase = 3;
 	atomic_set(&qp->deferred_votes, 0);
@@ -10505,6 +10654,7 @@ static int kona_icc_remove(struct platform_device *pdev)
 	cancel_delayed_work_sync(&qp->resume_floor_work);
 	cancel_delayed_work_sync(&qp->cpu_downvote_work);
 	cancel_delayed_work_sync(&qp->cpu_afm_work);
+	cancel_delayed_work_sync(&qp->cpu_mem_afm_work);
 	cancel_delayed_work_sync(&qp->retry_work);
 
 	/*

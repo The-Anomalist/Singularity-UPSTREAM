@@ -90,6 +90,9 @@ struct dev_data {
 	int cur_idx;
 	int cur_ab;
 	int cur_ib;
+	u32 icc_applied_avg;
+	u32 icc_applied_peak;
+	bool icc_applied_valid;
 	bool icc_supported;
 	bool use_icc;
 	bool icc_share_ab;
@@ -139,7 +142,7 @@ static int set_bw(struct device *dev, int new_ib, int new_ab)
 	int i, ret;
 	bool deferred = false;
 
-	if (d->cur_ib == new_ib && d->cur_ab == new_ab)
+	if (!d->use_icc && d->cur_ib == new_ib && d->cur_ab == new_ab)
 		return 0;
 
 	/*
@@ -244,6 +247,20 @@ static int set_bw(struct device *dev, int new_ib, int new_ab)
 				    d->num_icc_paths, d->icc_share_ab,
 				    d->icc_share_peak);
 
+		/*
+		 * Compare the final vote: display policy and ramp headroom can
+		 * change even when the governor requests the same bandwidth.
+		 */
+		if (d->icc_applied_valid &&
+		    d->icc_applied_avg == avg_bw &&
+		    d->icc_applied_peak == peak_bw) {
+			d->cur_ib = new_ib;
+			d->cur_ab = new_ab;
+			return 0;
+		}
+
+		/* A partial update must never match the last complete transaction. */
+		d->icc_applied_valid = false;
 		for (i = 0; i < d->num_icc_paths; i++) {
 			ret = icc_set_bw(d->icc_paths[i], avg_bw, peak_bw);
 			if (ret == -EAGAIN) {
@@ -265,6 +282,9 @@ static int set_bw(struct device *dev, int new_ib, int new_ab)
 		 * treating it as already applied.
 		 */
 		if (!deferred) {
+			d->icc_applied_avg = avg_bw;
+			d->icc_applied_peak = peak_bw;
+			d->icc_applied_valid = true;
 			d->cur_ib = new_ib;
 			d->cur_ab = new_ab;
 			d->icc_votes++;

@@ -1896,7 +1896,7 @@ static void unregister_adhoc(struct msm_bus_client_handle *cl)
 				cl->first_hop, cl->active_only);
 	commit_data();
 	msm_bus_dbg_remove_client(cl);
-	kfree(cl);
+	free_cl_mem(cl);
 	MSM_BUS_DBG("%s: Unregistered client", __func__);
 exit_unregister_client:
 	rt_mutex_unlock(&msm_bus_adhoc_lock);
@@ -1927,6 +1927,7 @@ register_adhoc(uint32_t mas, uint32_t slv, char *name, bool active_only)
 	if (!client->name) {
 		MSM_BUS_ERR("%s: Error allocating client name buf", __func__);
 		free_cl_mem(client);
+		client = NULL;
 		goto exit_register;
 	}
 	strlcpy(client->name, name, MAX_STR_CL);
@@ -1942,6 +1943,7 @@ register_adhoc(uint32_t mas, uint32_t slv, char *name, bool active_only)
 		MSM_BUS_ERR("%s:Failed to find path.src %d dest %d",
 			__func__, client->mas, client->slv);
 		free_cl_mem(client);
+		client = NULL;
 		goto exit_register;
 	}
 
@@ -1950,6 +1952,7 @@ register_adhoc(uint32_t mas, uint32_t slv, char *name, bool active_only)
 		MSM_BUS_ERR("%s:Failed to find path.src %d dest %d",
 			__func__, client->mas, client->slv);
 		free_cl_mem(client);
+		client = NULL;
 		goto exit_register;
 	}
 
