@@ -55,6 +55,17 @@
 /* CPU demand joins msm_bus; independent shared-BCM writes are unsafe. */
 #define KONA_CPU_MSM_BUS_OWNER 1
 
+/* Shadow transaction construction is diagnostic work under shared ownership. */
+static bool kona_shadow_model_enable;
+module_param_named(shadow_model_enable, kona_shadow_model_enable, bool, 0644);
+MODULE_PARM_DESC(shadow_model_enable,
+		 "Build diagnostic CPU BCM shadow models under shared bus ownership");
+
+static bool kona_icc_shadow_model_enabled(void)
+{
+	return !KONA_CPU_MSM_BUS_OWNER || READ_ONCE(kona_shadow_model_enable);
+}
+
 static bool kona_modern_hw_active_enable;
 module_param_named(modern_hw_active_enable,
 		   kona_modern_hw_active_enable, bool, 0444);
@@ -6363,6 +6374,10 @@ static void kona_icc_refresh_bcm_shadow(struct kona_icc_provider *qp)
 	u64 mem_avg, mem_peak;
 	u64 fabric_avg, fabric_peak;
 
+	/* The shared voter does not consume these candidate transaction images. */
+	if (!kona_icc_shadow_model_enabled())
+		return;
+
 	if (!qp || !qp->eff_ab || !qp->eff_ib)
 		return;
 
@@ -8408,7 +8423,8 @@ static void kona_icc_cpu_afm_workfn(struct work_struct *work)
 		container_of(to_delayed_work(work), struct kona_icc_provider,
 			     cpu_afm_work);
 
-	if (READ_ONCE(qp->system_suspended) ||
+	if (!kona_icc_shadow_model_enabled() ||
+	    READ_ONCE(qp->system_suspended) ||
 	    atomic_read(&qp->votes_paused))
 		return;
 
@@ -8427,7 +8443,8 @@ static void kona_icc_cpu_mem_afm_workfn(struct work_struct *work)
 		container_of(to_delayed_work(work), struct kona_icc_provider,
 			     cpu_mem_afm_work);
 
-	if (READ_ONCE(qp->system_suspended) ||
+	if (!kona_icc_shadow_model_enabled() ||
+	    READ_ONCE(qp->system_suspended) ||
 	    atomic_read(&qp->votes_paused))
 		return;
 
@@ -8935,7 +8952,11 @@ skip_perf_floor:
 static int kona_icc_set(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 {
 	struct kona_icc_provider *qp;
-	int ret;
+	struct kona_icc_client_vote *client;
+	u64 prev_avg, prev_peak;
+	u32 prev_tag, requested_tag;
+	bool prev_valid;
+	int ret, rollback_ret;
 
 	if (IS_ERR_OR_NULL(path) || !path->provider)
 		return -EINVAL;
@@ -8955,7 +8976,41 @@ static int kona_icc_set(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 	 * transaction, and cache update with a provider-wide mutex.
 	 */
 	mutex_lock(&qp->vote_lock);
+	client = path->data;
+	if (!client || client->qp != qp || client->index >= qp->num_nodes) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	prev_avg = client->avg_bw;
+	prev_peak = client->peak_bw;
+	prev_tag = client->tag;
+	prev_valid = client->valid;
+	requested_tag = path->tag;
+
 	ret = __kona_icc_set(path, avg_bw, peak_bw);
+	if (ret) {
+		/* Match the ICC core: rejected requests must not join later votes. */
+		if (qp->last_ab)
+			qp->last_ab[client->index] = U64_MAX;
+		if (qp->last_ib)
+			qp->last_ib[client->index] = U64_MAX;
+		path->tag = prev_tag;
+		rollback_ret = __kona_icc_set(path, prev_avg, prev_peak);
+		path->tag = requested_tag;
+		client->avg_bw = prev_avg;
+		client->peak_bw = prev_peak;
+		client->tag = prev_tag;
+		client->valid = prev_valid;
+
+		if (rollback_ret) {
+			kona_icc_mark_dirty(qp, client->index);
+			kona_icc_queue_replay(qp, KONA_RETRY_DELAY_MS,
+					      "request-rollback");
+		}
+	}
+
+out_unlock:
 	mutex_unlock(&qp->vote_lock);
 
 	return ret;
@@ -8979,6 +9034,9 @@ static int kona_param_get_cpu_bcm_stats(char *buffer,
 	mutex_lock(&qp->vote_lock);
 	dynamic = qp->packed_dynamic_inputs;
 	effective = qp->packed_current_inputs;
+
+	len += scnprintf(buffer + len, PAGE_SIZE - len,
+		"shadow_model enabled=%u\n", kona_icc_shadow_model_enabled());
 
 	len += scnprintf(buffer + len, PAGE_SIZE - len,
 		"shadow_evaluations=%llu shadow_changes=%llu "
