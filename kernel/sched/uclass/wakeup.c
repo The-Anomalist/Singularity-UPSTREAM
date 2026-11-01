@@ -16,9 +16,11 @@ bool uclass_wakeup_preempt_enabled(void)
 
 unsigned long uclass_adjust_wakeup_gran(struct task_struct *curr,
 					struct task_struct *p,
-					unsigned long gran)
+					unsigned long gran,
+					unsigned long min_gran)
 {
 	unsigned int boost_pct;
+	unsigned long original = gran;
 
 	if (unlikely(!uclass_wakeup_preempt_enabled()))
 		return gran;
@@ -29,5 +31,5 @@ unsigned long uclass_adjust_wakeup_gran(struct task_struct *curr,
 	boost_pct = uclass_effective_gran_boost_pct(curr, p);
 	gran = mult_frac(gran, 100 - boost_pct, 100);
 
-	return max_t(unsigned long, gran, sysctl_sched_min_granularity / 2);
+	return min(original, max(gran, min_gran));
 }

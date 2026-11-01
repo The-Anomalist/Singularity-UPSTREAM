@@ -30,7 +30,8 @@ unsigned int uclass_idle_exit_latency_limit_us(struct task_struct *p);
 
 unsigned long uclass_adjust_wakeup_gran(struct task_struct *curr,
 					struct task_struct *p,
-					unsigned long gran);
+					unsigned long gran,
+					unsigned long min_gran);
 
 bool uclass_pick_idle_cpu_first(struct task_struct *p);
 bool uclass_prefer_prev_cpu(struct task_struct *p);
@@ -86,10 +87,11 @@ static inline unsigned int uclass_idle_exit_latency_limit_us(struct task_struct 
 static inline unsigned long
 uclass_adjust_wakeup_gran(struct task_struct *curr,
 			  struct task_struct *p,
-			  unsigned long gran)
+			  unsigned long gran, unsigned long min_gran)
 {
 	(void)curr;
 	(void)p;
+	(void)min_gran;
 	return gran;
 }
 

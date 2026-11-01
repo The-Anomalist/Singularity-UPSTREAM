@@ -74,7 +74,7 @@ unsigned int uclass_idle_exit_latency_limit_us(struct task_struct *p)
 		return limit;
 
 	if (uclass_task_high_util(p))
-		limit = max_t(unsigned int, limit / 2, 50);
+		limit = min(limit, max_t(unsigned int, limit / 2, 50));
 
 	return limit;
 }

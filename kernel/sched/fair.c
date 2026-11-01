@@ -8444,10 +8444,14 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 		int preempt = wakeup_preempt_entity(se, pse);
 
 		if (preempt == 0) {
-			unsigned long gran;
+			unsigned long gran, min_gran;
 			s64 vdiff;
 
-			gran = uclass_adjust_wakeup_gran(curr, p, wakeup_gran(pse));
+			/* Both thresholds must use this entity's virtual runtime. */
+			min_gran = calc_delta_fair(sysctl_sched_min_granularity / 2,
+						   pse);
+			gran = uclass_adjust_wakeup_gran(curr, p,
+							 wakeup_gran(pse), min_gran);
 			vdiff = se->vruntime - pse->vruntime;
 			if (vdiff <= (s64)gran)
 				return;

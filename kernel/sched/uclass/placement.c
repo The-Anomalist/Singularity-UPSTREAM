@@ -47,12 +47,17 @@ bool uclass_idle_candidate_is_better(unsigned long cpu_cap,
 {
 	unsigned int limit;
 
-	if (unlikely(!idle || cpu_cap != target_cap))
+	if (unlikely(!idle))
 		return true;
 
-	limit = uclass_idle_exit_latency_limit_us(p);
-	if (limit && idle->exit_latency > limit)
-		return false;
+	if (uclass_placement_enabled()) {
+		limit = uclass_idle_exit_latency_limit_us(p);
+		if (limit && idle->exit_latency > limit)
+			return false;
+	}
+
+	if (cpu_cap != target_cap)
+		return true;
 
 	if (uclass_placement_enabled() && READ_ONCE(sysctl_sched_uclass_idle_bias))
 		return idle->exit_latency < min_exit_lat;
