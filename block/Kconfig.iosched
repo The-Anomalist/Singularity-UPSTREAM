@@ -38,10 +38,11 @@ config IOSCHED_SINGULARITY
 	depends on BLK_CGROUP
 	default n
 	help
-	  Singularity is a cgroup-aware scheduler focused on foreground
-	  latency on UFS-class storage. It uses weighted round-robin across
-	  blkcg-derived buckets and prioritizes synchronous I/O with bounded
-	  batching to avoid background starvation.
+	  Singularity is a legacy single-queue scheduler for UFS-class storage.
+	  It uses equal round-robin service across hashed blkcg buckets and
+	  prioritizes synchronous I/O with bounded batching and FIFO age checks.
+	  Sync I/O is not an Android foreground-app classification, and cgroup
+	  weights are not used. Different cgroups can share a scheduling bucket.
 
 config CFQ_GROUP_IOSCHED
 	bool "CFQ Group Scheduling support"
