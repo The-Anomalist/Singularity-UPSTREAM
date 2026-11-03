@@ -222,9 +222,6 @@ xt_request_find_match(uint8_t nfproto, const char *name, uint8_t revision)
 		match = xt_find_match(nfproto, name, revision);
 	}
 
-	if (IS_ERR(match))
-		pr_warn_ratelimited("NHNF lookup match: family=%u name=%s revision=%u error=%ld\n",
-				    nfproto, name, revision, PTR_ERR(match));
 	return match;
 }
 EXPORT_SYMBOL_GPL(xt_request_find_match);
@@ -273,9 +270,6 @@ struct xt_target *xt_request_find_target(u8 af, const char *name, u8 revision)
 		target = xt_find_target(af, name, revision);
 	}
 
-	if (IS_ERR(target))
-		pr_warn_ratelimited("NHNF lookup target: family=%u name=%s revision=%u error=%ld\n",
-				    af, name, revision, PTR_ERR(target));
 	return target;
 }
 EXPORT_SYMBOL_GPL(xt_request_find_target);
@@ -523,13 +517,8 @@ int xt_check_match(struct xt_mtchk_param *par,
 	}
 	if (par->match->checkentry != NULL) {
 		ret = par->match->checkentry(par);
-		if (ret < 0) {
-			pr_warn_ratelimited("NHNF check match: family=%u table=%s name=%s revision=%u error=%d\n",
-					    par->family, par->table,
-					    par->match->name,
-					    par->match->revision, ret);
+		if (ret < 0)
 			return ret;
-		}
 		else if (ret > 0)
 			/* Flag up potential errors. */
 			return -EIO;
@@ -1055,13 +1044,8 @@ int xt_check_target(struct xt_tgchk_param *par,
 	}
 	if (par->target->checkentry != NULL) {
 		ret = par->target->checkentry(par);
-		if (ret < 0) {
-			pr_warn_ratelimited("NHNF check target: family=%u table=%s name=%s revision=%u error=%d\n",
-					    par->family, par->table,
-					    par->target->name,
-					    par->target->revision, ret);
+		if (ret < 0)
 			return ret;
-		}
 		else if (ret > 0)
 			/* Flag up potential errors. */
 			return -EIO;

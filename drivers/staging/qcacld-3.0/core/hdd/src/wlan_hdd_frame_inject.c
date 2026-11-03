@@ -123,7 +123,6 @@ QDF_STATUS hdd_init_frame_injection(struct hdd_adapter *adapter)
 
 	/* Initialize other fields */
 	injection_ctx->is_monitor_mode = false;
-	injection_ctx->quiescing = false;
 	injection_ctx->adapter = adapter;
 	injection_ctx->wma_handle = cds_get_context(QDF_MODULE_ID_WMA);
 	if (!injection_ctx->wma_handle)
@@ -253,7 +252,6 @@ QDF_STATUS hdd_deinit_frame_injection(struct hdd_adapter *adapter)
 QDF_STATUS hdd_frame_inject_enable(struct hdd_adapter *adapter)
 {
 	struct hdd_injection_ctx *injection_ctx;
-	QDF_STATUS status;
 
 	hdd_inject_debug("Enabling frame injection for adapter %pK", adapter);
 
@@ -263,16 +261,7 @@ QDF_STATUS hdd_frame_inject_enable(struct hdd_adapter *adapter)
 	}
 
 	injection_ctx = adapter->injection_ctx;
-	if (!injection_ctx->wma_handle)
-		injection_ctx->wma_handle = cds_get_context(QDF_MODULE_ID_WMA);
-	status = wma_injection_resume(injection_ctx->wma_handle);
-	if (QDF_IS_STATUS_ERROR(status))
-		return status;
-
-	qdf_spin_lock_bh(&injection_ctx->queue_lock);
-	injection_ctx->quiescing = false;
 	injection_ctx->is_monitor_mode = true;
-	qdf_spin_unlock_bh(&injection_ctx->queue_lock);
 
 	hdd_inject_info("Frame injection enabled for adapter %pK", adapter);
 	return QDF_STATUS_SUCCESS;
@@ -289,8 +278,6 @@ QDF_STATUS hdd_frame_inject_enable(struct hdd_adapter *adapter)
 QDF_STATUS hdd_frame_inject_disable(struct hdd_adapter *adapter)
 {
 	struct hdd_injection_ctx *injection_ctx;
-	struct inject_frame_req *req;
-	qdf_list_node_t *node;
 
 	hdd_inject_debug("Disabling frame injection for adapter %pK", adapter);
 
@@ -300,26 +287,7 @@ QDF_STATUS hdd_frame_inject_disable(struct hdd_adapter *adapter)
 	}
 
 	injection_ctx = adapter->injection_ctx;
-	qdf_spin_lock_bh(&injection_ctx->queue_lock);
-	injection_ctx->quiescing = true;
 	injection_ctx->is_monitor_mode = false;
-	qdf_spin_unlock_bh(&injection_ctx->queue_lock);
-	qdf_cancel_work(&injection_ctx->queue_work);
-	qdf_flush_work(&injection_ctx->queue_work);
-	for (;;) {
-		qdf_spin_lock_bh(&injection_ctx->queue_lock);
-		if (QDF_IS_STATUS_ERROR(qdf_list_remove_front(
-				&injection_ctx->injection_queue, &node))) {
-			qdf_spin_unlock_bh(&injection_ctx->queue_lock);
-			break;
-		}
-		qdf_spin_unlock_bh(&injection_ctx->queue_lock);
-		req = qdf_container_of(node, struct inject_frame_req, node);
-		qdf_mem_free(req->frame_data);
-		qdf_mem_free(req);
-	}
-	if (injection_ctx->wma_handle)
-		wma_injection_pre_stop_cleanup(injection_ctx->wma_handle);
 
 	hdd_inject_info("Frame injection disabled for adapter %pK", adapter);
 	return QDF_STATUS_SUCCESS;
@@ -415,16 +383,14 @@ QDF_STATUS hdd_process_frame_injection(struct hdd_adapter *adapter,
 	struct hdd_injection_ctx *injection_ctx;
 	QDF_STATUS status;
 	uint8_t frame_type;
-	uint32_t session_id;
+
+	hdd_inject_debug("Processing frame injection: session_id=%u, len=%u",
+			 req->session_id, req->frame_len);
 
 	if (!adapter || !adapter->injection_ctx || !req) {
 		hdd_inject_err("Invalid parameters");
 		return QDF_STATUS_E_INVAL;
 	}
-
-	session_id = req->session_id;
-	hdd_inject_debug("Processing frame injection: session_id=%u, len=%u",
-			 session_id, req->frame_len);
 
 	/* NH address audit: before validation and sanitization. */
 	if (req->frame_data && req->frame_len >= 24 &&
@@ -492,15 +458,8 @@ QDF_STATUS hdd_process_frame_injection(struct hdd_adapter *adapter,
 		return QDF_STATUS_E_NOSUPPORT;
 	}
 
-	req->queue_time = qdf_get_log_timestamp();
-
 	/* Queue frame for injection */
 	qdf_spin_lock_bh(&injection_ctx->queue_lock);
-
-	if (injection_ctx->quiescing) {
-		qdf_spin_unlock_bh(&injection_ctx->queue_lock);
-		return QDF_STATUS_E_AGAIN;
-	}
 
 	/* Check queue size limit */
 	if (qdf_list_size(&injection_ctx->injection_queue) >=
@@ -519,6 +478,9 @@ QDF_STATUS hdd_process_frame_injection(struct hdd_adapter *adapter,
 		return status;
 	}
 
+	/* Update timing for queue entry */
+	req->queue_time = qdf_get_log_timestamp();
+
 	/* Update statistics for successful submission */
 	hdd_update_injection_stats(adapter, HDD_INJECTION_STAT_FRAMES_SUBMITTED, 1);
 
@@ -532,7 +494,7 @@ QDF_STATUS hdd_process_frame_injection(struct hdd_adapter *adapter,
 	qdf_sched_work(0, &injection_ctx->queue_work);
 
 	hdd_inject_debug("Frame injection queued successfully: session_id=%u",
-			 session_id);
+			 req->session_id);
 	return QDF_STATUS_SUCCESS;
 }
 

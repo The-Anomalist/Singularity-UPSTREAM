@@ -32,7 +32,6 @@
 #include <wlan_vdev_mlme_main.h>
 #include <wmi_unified_vdev_api.h>
 #include <target_if_psoc_wake_lock.h>
-#include <include/wlan_mlme_cmn.h>
 
 static inline
 void target_if_vdev_mgr_handle_recovery(struct wlan_objmgr_psoc *psoc,
@@ -276,11 +275,6 @@ static int target_if_vdev_mgr_start_response_handler(ol_scn_t scn,
 	}
 
 	vdev_id = vdev_start_resp.vdev_id;
-	if (mlme_fw_only_vdev_response(psoc, vdev_id,
-				      MLME_FW_ONLY_VDEV_START,
-				      vdev_start_resp.status))
-		return 0;
-
 	vdev_rsp = rx_ops->psoc_get_vdev_response_timer_info(psoc, vdev_id);
 	if (!vdev_rsp) {
 		mlme_err("vdev response timer is null VDEV_%d PSOC_%d",
@@ -359,10 +353,6 @@ static int target_if_vdev_mgr_stop_response_handler(ol_scn_t scn,
 		return -EINVAL;
 	}
 
-	if (mlme_fw_only_vdev_response(psoc, vdev_id,
-				      MLME_FW_ONLY_VDEV_STOP, 0))
-		return 0;
-
 	vdev_rsp = rx_ops->psoc_get_vdev_response_timer_info(psoc, vdev_id);
 	if (!vdev_rsp) {
 		mlme_err("vdev response timer is null VDEV_%d PSOC_%d",
@@ -425,10 +415,6 @@ static int target_if_vdev_mgr_delete_response_handler(ol_scn_t scn,
 		mlme_err("WMI extract failed");
 		return -EINVAL;
 	}
-
-	if (mlme_fw_only_vdev_response(psoc, vdev_del_resp.vdev_id,
-				      MLME_FW_ONLY_VDEV_DELETE, 0))
-		return 0;
 
 	vdev_rsp = rx_ops->psoc_get_vdev_response_timer_info(psoc,
 							 vdev_del_resp.vdev_id);

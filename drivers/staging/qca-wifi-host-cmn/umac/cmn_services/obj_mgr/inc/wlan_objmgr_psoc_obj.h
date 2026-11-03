@@ -306,7 +306,6 @@ struct wlan_objmgr_psoc_objmgr {
 	struct wlan_objmgr_pdev *wlan_pdev_list[WLAN_UMAC_MAX_PDEVS];
 	struct wlan_objmgr_vdev *wlan_vdev_list[WLAN_UMAC_PSOC_MAX_VDEVS];
 	uint32_t wlan_vdev_id_map[2];
-	uint32_t fw_vdev_id_map[2];
 	struct wlan_peer_list peer_list;
 	qdf_atomic_t ref_cnt;
 	qdf_atomic_t ref_id_dbg[WLAN_REF_ID_MAX];
@@ -1755,11 +1754,5 @@ void wlan_print_psoc_info(struct wlan_objmgr_psoc *psoc);
 #else
 static inline void wlan_print_psoc_info(struct wlan_objmgr_psoc *psoc) {}
 #endif
-
-/* Reserve/release an ID without creating a host vdev object. */
-QDF_STATUS wlan_objmgr_psoc_reserve_fw_vdev_id(struct wlan_objmgr_psoc *psoc,
-					     uint8_t id);
-void wlan_objmgr_psoc_release_fw_vdev_id(struct wlan_objmgr_psoc *psoc,
-				       uint8_t id);
 
 #endif /* _WLAN_OBJMGR_PSOC_OBJ_H_*/

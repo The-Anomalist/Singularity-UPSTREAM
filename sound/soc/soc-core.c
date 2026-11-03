@@ -40,8 +40,6 @@
 #include <sound/soc-topology.h>
 #include <sound/initval.h>
 
-#include "soc-singularity-audio.h"
-
 #define CREATE_TRACE_POINTS
 #include <trace/events/asoc.h>
 
@@ -2176,10 +2174,6 @@ static int snd_soc_instantiate_card(struct snd_soc_card *card)
 	}
 
 	snd_soc_dapm_new_widgets(card);
-
-	ret = snd_soc_singularity_audio_add(card);
-	if (ret < 0)
-		dev_warn(card->dev, "ASoC: audio gain sysfs unavailable: %d\n", ret);
 
 	ret = snd_card_register(card->snd_card);
 	if (ret < 0) {

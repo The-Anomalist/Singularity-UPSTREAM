@@ -4650,10 +4650,6 @@ QDF_STATUS wma_mon_mlme_vdev_up_send(struct vdev_mlme_obj *vdev_mlme,
 	vdev_mlme->proto.sta.assoc_id = 0;
 
 	status = vdev_mgr_up_send(vdev_mlme);
-	WMA_LOGI("NHMON up: vdev=%u status=%d state=%u substate=%u",
-		 vdev_id, status,
-		 wlan_vdev_mlme_get_state(vdev_mlme->vdev),
-		 wlan_vdev_mlme_get_substate(vdev_mlme->vdev));
 	if (QDF_IS_STATUS_ERROR(status))
 		WMA_LOGE("%s: Failed to send vdev up cmd: vdev %d",
 			 __func__, vdev_id);

@@ -4933,13 +4933,12 @@ static const struct net_device_ops wlan_drv_ops = {
 };
 
 #ifdef FEATURE_MONITOR_MODE_SUPPORT
-/* Monitor mode net_device_ops. */
+/* Monitor mode net_device_ops, doesnot Tx and most of operations. */
 static const struct net_device_ops wlan_mon_drv_ops = {
 	.ndo_open = hdd_mon_open,
 	.ndo_stop = hdd_stop,
 	.ndo_start_xmit = hdd_hard_start_xmit,
 	.ndo_get_stats = hdd_get_stats,
-	.ndo_set_mac_address = hdd_set_mac_address,
 };
 
 #ifdef WLAN_FEATURE_TSF_PTP
