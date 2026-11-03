@@ -30,6 +30,7 @@
 
 /* Include for complete type definitions */
 #include "wma.h"
+#include <include/wlan_mlme_cmn.h>
 
 /* Forward declarations */
 struct inject_frame_req;
@@ -119,6 +120,12 @@ struct wma_injection_queue_stats {
 };
 
 #ifdef FEATURE_FRAME_INJECTION_SUPPORT
+
+bool wma_injection_vdev_response(struct wlan_objmgr_psoc *psoc,
+	uint8_t vdev_id, enum mlme_fw_only_vdev_event event,
+	uint32_t fw_status);
+QDF_STATUS wma_injection_resume(tp_wma_handle wma_handle);
+void wma_injection_fw_detached(void);
 
 /**
  * wma_init_injection_queue() - Initialize WMA injection queue
@@ -326,6 +333,23 @@ QDF_STATUS wma_sync_firmware_injection_state(tp_wma_handle wma_handle,
 enum wma_injection_fw_error_type wma_translate_fw_injection_error(uint32_t fw_error_code);
 
 #else /* FEATURE_FRAME_INJECTION_SUPPORT */
+
+static inline bool
+wma_injection_vdev_response(struct wlan_objmgr_psoc *psoc, uint8_t vdev_id,
+			   enum mlme_fw_only_vdev_event event,
+			   uint32_t fw_status)
+{
+	return false;
+}
+
+static inline void wma_injection_fw_detached(void)
+{
+}
+
+static inline QDF_STATUS wma_injection_resume(tp_wma_handle wma_handle)
+{
+	return QDF_STATUS_SUCCESS;
+}
 
 static inline QDF_STATUS wma_init_injection_queue(tp_wma_handle wma_handle)
 {

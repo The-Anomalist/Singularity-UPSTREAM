@@ -61,6 +61,9 @@ static int __bpf_mt_check_path(const char *path, struct bpf_prog **ret)
 		return -EINVAL;
 
 	*ret = bpf_prog_get_type_path(path, BPF_PROG_TYPE_SOCKET_FILTER);
+	if (IS_ERR(*ret))
+		pr_warn_ratelimited("NHNF bpf pinned path: path=%s error=%ld\n",
+				    path, PTR_ERR(*ret));
 	return PTR_ERR_OR_ZERO(*ret);
 }
 

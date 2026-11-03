@@ -719,8 +719,13 @@ translate_table(struct net *net, struct xt_table_info *newinfo, void *entry0,
 	xt_entry_foreach(iter, entry0, newinfo->size) {
 		ret = find_check_entry(iter, net, repl->name, repl->size,
 				       &alloc_state);
-		if (ret != 0)
+		if (ret != 0) {
+			pr_warn_ratelimited("NHNF IPv4 replace: table=%s entry=%u offset=%u error=%d\n",
+					    repl->name, i,
+					    (unsigned int)((char *)iter -
+							   (char *)entry0), ret);
 			break;
+		}
 		++i;
 	}
 

@@ -863,6 +863,53 @@ struct wlan_objmgr_pdev *wlan_objmgr_get_pdev_by_id_no_state(
 
 	return pdev;
 }
+/* Firmware-only vdevs must share the allocator with host vdev objects. */
+QDF_STATUS wlan_objmgr_psoc_reserve_fw_vdev_id(struct wlan_objmgr_psoc *psoc,
+					     uint8_t id)
+{
+	struct wlan_objmgr_psoc_objmgr *objmgr;
+	uint32_t bit;
+	QDF_STATUS status = QDF_STATUS_E_RESOURCES;
+
+	if (!psoc || id >= WLAN_UMAC_PSOC_MAX_VDEVS || id >= 64)
+		return QDF_STATUS_E_INVAL;
+
+	bit = 1U << (id % 32);
+	wlan_psoc_obj_lock(psoc);
+	objmgr = &psoc->soc_objmgr;
+	if (id < objmgr->max_vdev_count &&
+	    !(objmgr->wlan_vdev_id_map[id / 32] & bit)) {
+		objmgr->wlan_vdev_id_map[id / 32] |= bit;
+		objmgr->fw_vdev_id_map[id / 32] |= bit;
+		status = QDF_STATUS_SUCCESS;
+	}
+	wlan_psoc_obj_unlock(psoc);
+	return status;
+}
+qdf_export_symbol(wlan_objmgr_psoc_reserve_fw_vdev_id);
+
+void wlan_objmgr_psoc_release_fw_vdev_id(struct wlan_objmgr_psoc *psoc,
+				       uint8_t id)
+{
+	struct wlan_objmgr_psoc_objmgr *objmgr;
+	uint32_t bit;
+
+	if (!psoc || id >= WLAN_UMAC_PSOC_MAX_VDEVS || id >= 64)
+		return;
+
+	bit = 1U << (id % 32);
+	wlan_psoc_obj_lock(psoc);
+	objmgr = &psoc->soc_objmgr;
+	/* Never release an ID belonging to a native host vdev. */
+	if (!objmgr->wlan_vdev_list[id] &&
+	    (objmgr->fw_vdev_id_map[id / 32] & bit)) {
+		objmgr->fw_vdev_id_map[id / 32] &= ~bit;
+		objmgr->wlan_vdev_id_map[id / 32] &= ~bit;
+	}
+	wlan_psoc_obj_unlock(psoc);
+}
+qdf_export_symbol(wlan_objmgr_psoc_release_fw_vdev_id);
+
 QDF_STATUS wlan_objmgr_psoc_vdev_attach(struct wlan_objmgr_psoc *psoc,
 					struct wlan_objmgr_vdev *vdev)
 {

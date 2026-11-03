@@ -129,6 +129,13 @@ QDF_STATUS lim_send_switch_chnl_params(struct mac_context *mac,
 		pe_err("failed status = %d", status);
 		goto send_resp;
 	}
+	if (session->bssType == eSIR_MONITOR_MODE)
+		pe_warn("NHMON request: vdev=%u state=%u substate=%u restart=%u",
+			session->vdev_id,
+			wlan_vdev_mlme_get_state(session->vdev),
+			wlan_vdev_mlme_get_substate(session->vdev),
+			!!mlme_is_chan_switch_in_progress(session->vdev));
+
 	status = vdev_mgr_start_send(mlme_obj,
 				mlme_is_chan_switch_in_progress(session->vdev));
 	if (status != QDF_STATUS_SUCCESS) {

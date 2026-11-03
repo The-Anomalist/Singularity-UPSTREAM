@@ -194,6 +194,17 @@ QDF_STATUS mlme_vdev_enqueue_exp_ser_cmd(struct vdev_mlme_obj *vdev_mlme,
 	return ret;
 }
 
+bool mlme_fw_only_vdev_response(struct wlan_objmgr_psoc *psoc,
+	uint8_t vdev_id, enum mlme_fw_only_vdev_event event,
+	uint32_t fw_status)
+{
+	if (glbl_ops && glbl_ops->mlme_fw_only_vdev_response)
+		return glbl_ops->mlme_fw_only_vdev_response(psoc, vdev_id,
+							 event, fw_status);
+
+	return false;
+}
+
 QDF_STATUS mlme_vdev_ops_ext_hdl_delete_rsp(struct wlan_objmgr_psoc *psoc,
 					    struct vdev_delete_response *rsp)
 {

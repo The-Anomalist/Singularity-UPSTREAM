@@ -22,6 +22,16 @@ menuconfig SND_SOC
 
 if SND_SOC
 
+config SND_SOC_SINGULARITY_AUDIO
+	bool "Singularity audio gain sysfs controls"
+	default y if ARCH_QCOM
+	help
+	  Expose existing scalar codec gain controls and a bound audio component
+	  inventory under each ALSA card's singularity_audio sysfs directory.
+	  Writes require root and are checked against the driver's mixer limits.
+	  This does not override later mixer writes from Android or add Bluetooth
+	  codecs. No audio register is changed by enabling this option.
+
 config SND_SOC_AC97_BUS
 	bool
 

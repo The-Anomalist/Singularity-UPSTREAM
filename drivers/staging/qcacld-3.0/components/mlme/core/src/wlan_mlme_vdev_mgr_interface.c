@@ -22,6 +22,7 @@
 #include "wlan_mlme_vdev_mgr_interface.h"
 #include "lim_utils.h"
 #include "wma_api.h"
+#include "wma_frame_inject.h"
 #include "lim_types.h"
 #include <include/wlan_mlme_cmn.h>
 #include <../../core/src/vdev_mgr_ops.h>
@@ -1435,6 +1436,7 @@ static struct vdev_mlme_ops mon_mlme_ops = {
 };
 
 static struct mlme_ext_ops ext_ops = {
+	.mlme_fw_only_vdev_response = wma_injection_vdev_response,
 	.mlme_psoc_ext_hdl_create = psoc_mlme_ext_hdl_create,
 	.mlme_psoc_ext_hdl_destroy = psoc_mlme_ext_hdl_destroy,
 	.mlme_vdev_ext_hdl_create = vdevmgr_mlme_ext_hdl_create,

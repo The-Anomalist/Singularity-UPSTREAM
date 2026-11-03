@@ -3424,7 +3424,6 @@ static int lookup_open(struct nameidata *nd, struct path *path,
 	umode_t mode = op->mode;
 	DECLARE_WAIT_QUEUE_HEAD_ONSTACK(wq);
 #ifdef CONFIG_KSU_SUSFS_SUS_PATH
-	bool found_sus_path = false;
 	bool is_open_last = nd->state & ND_STATE_OPEN_LAST;
 #endif
 
@@ -3438,23 +3437,15 @@ static int lookup_open(struct nameidata *nd, struct path *path,
 	if (is_open_last && dentry && !IS_ERR(dentry) &&
 	    dentry->d_inode &&
 	    susfs_is_inode_sus_path(dentry->d_inode)) {
-		if (d_in_lookup(dentry))
-			d_lookup_done(dentry);
+		/* SUSFS: reject hidden opens before filesystem side effects. */
 		dput(dentry);
-		dentry = NULL;
-		found_sus_path = true;
+		return (open_flag & O_CREAT) ? -EACCES : -ENOENT;
 	}
 #endif
 
 	for (;;) {
 		if (!dentry) {
-#ifdef CONFIG_KSU_SUSFS_SUS_PATH
-			if (found_sus_path)
-				dentry = d_alloc_parallel(
-					dir, &susfs_fake_qstr_name, &wq);
-			else
-#endif
-				dentry = d_alloc_parallel(dir, &nd->last, &wq);
+			dentry = d_alloc_parallel(dir, &nd->last, &wq);
 			if (IS_ERR(dentry))
 				return PTR_ERR(dentry);
 		}
@@ -3511,12 +3502,15 @@ static int lookup_open(struct nameidata *nd, struct path *path,
 	}
 
 	if (dir_inode->i_op->atomic_open) {
-#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+#if defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT) || defined(CONFIG_KSU_SUSFS_SUS_PATH)
 		/*
 		 * Linux 4.19 may open the file directly from atomic_open().
 		 * SUSFS v2 OPEN_REDIRECT must inspect the resolved inode and
 		 * redirect before the original file is opened, so use the
 		 * ordinary lookup/create path while OPEN_REDIRECT is enabled.
+		 */
+		/*
+		 * Resolve the inode before opening so SUS_PATH can check it.
 		 */
 		goto no_open;
 #else
@@ -3543,6 +3537,14 @@ no_open:
 		}
 	}
 
+#ifdef CONFIG_KSU_SUSFS_SUS_PATH
+	if (is_open_last && dentry->d_inode &&
+	    susfs_is_inode_sus_path(dentry->d_inode)) {
+		error = (open_flag & O_CREAT) ? -EACCES : -ENOENT;
+		goto out_dput;
+	}
+#endif
+
 	/* Negative dentry, just create the file */
 	if (!dentry->d_inode && (open_flag & O_CREAT)) {
 		file->f_mode |= FMODE_CREATED;
@@ -3562,6 +3564,13 @@ no_open:
 		goto out_dput;
 	}
 out_no_open:
+#ifdef CONFIG_KSU_SUSFS_SUS_PATH
+	if (is_open_last && dentry->d_inode &&
+	    susfs_is_inode_sus_path(dentry->d_inode)) {
+		error = (open_flag & O_CREAT) ? -EACCES : -ENOENT;
+		goto out_dput;
+	}
+#endif
 	path->dentry = dentry;
 	path->mnt = nd->path.mnt;
 	return 0;
