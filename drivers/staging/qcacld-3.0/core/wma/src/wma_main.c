@@ -4365,6 +4365,7 @@ QDF_STATUS wma_wmi_service_close(void)
 	/* dettach the wmi serice */
 	WMA_LOGD("calling wmi_unified_detach");
 	wmi_unified_detach(wma_handle->wmi_handle);
+	wma_injection_fw_detached();
 	wma_handle->wmi_handle = NULL;
 
 	for (i = 0; i < wma_handle->max_bssid; i++)

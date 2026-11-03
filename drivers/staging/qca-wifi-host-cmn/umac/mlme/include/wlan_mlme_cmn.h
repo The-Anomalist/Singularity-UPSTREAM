@@ -50,7 +50,19 @@
  * @mlme_multi_vdev_restart_resp:    callback to process multivdev restart
  *				     response
  */
+/* Responses for a firmware-only vdev that has no MLME object/timer. */
+enum mlme_fw_only_vdev_event {
+	MLME_FW_ONLY_VDEV_START,
+	MLME_FW_ONLY_VDEV_STOP,
+	MLME_FW_ONLY_VDEV_DELETE,
+	MLME_FW_ONLY_PEER_DELETE,
+	MLME_FW_ONLY_VDEV_EVENT_MAX
+};
+
 struct mlme_ext_ops {
+	bool (*mlme_fw_only_vdev_response)(struct wlan_objmgr_psoc *psoc,
+		uint8_t vdev_id, enum mlme_fw_only_vdev_event event,
+		uint32_t fw_status);
 	QDF_STATUS (*mlme_psoc_ext_hdl_create)(
 				struct psoc_mlme_obj *psoc_mlme);
 	QDF_STATUS (*mlme_psoc_ext_hdl_destroy)(
@@ -242,6 +254,10 @@ QDF_STATUS mlme_vdev_ops_ext_hdl_multivdev_restart_resp(
  *
  * Return: void
  */
+bool mlme_fw_only_vdev_response(struct wlan_objmgr_psoc *psoc,
+	uint8_t vdev_id, enum mlme_fw_only_vdev_event event,
+	uint32_t fw_status);
+
 typedef struct mlme_ext_ops *(*mlme_get_global_ops_cb)(void);
 void mlme_set_ops_register_cb(mlme_get_global_ops_cb ops_cb);
 

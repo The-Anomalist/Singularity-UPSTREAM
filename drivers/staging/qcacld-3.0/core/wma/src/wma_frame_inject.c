@@ -40,7 +40,12 @@
 #include "qdf_delayed_work.h"
 #include "qdf_time.h"
 #include <linux/spinlock.h>
+#include <linux/completion.h>
+#include <linux/jiffies.h>
+#include <linux/mutex.h>
 #include "cds_api.h"
+#include "wlan_reg_services_api.h"
+#include "wlan_vdev_mlme_api.h"
 #include "cdp_txrx_cmn.h"
 #include <wlan_vdev_mgr_tgt_if_tx_defs.h>
 #if defined(CONFIG_HL_SUPPORT)
@@ -182,37 +187,146 @@ static struct wma_injection_debug_info
 static DEFINE_SPINLOCK(g_wma_injection_cache_lock);
 
 /*
- * Hidden AP vdev for injection TX on monitor mode.
- *
- * The firmware's mgmt TX handler (FUN_b000fc10, _wlan_send_mgmt_to_host)
- * unconditionally rejects management frames on MONITOR vdevs: the internal
- * vdev-type switch only accepts AP(0), STA(1), IBSS(2), OCB(6) for the
- * normal peer-lookup → WAL-TX path.  MONITOR(3) is shunted to a
- * beacon-only fallback (FUN_b01baa34) that always returns 5 → DISCARD.
- *
- * Work around this by creating a lightweight AP vdev on the same channel
- * as the monitor interface and routing injected frames through it.  The AP
- * vdev has a self-peer (stored at firmware vdev+0xc) so the firmware can
- * schedule and transmit the management frame normally.
- *
- * Lifecycle:
- *   Created lazily on the first injection attempt on a monitor vdev.
- *   Destroyed in wma_deinit_injection_queue() or when the channel changes.
- *   WMI response events for this vdev (create/start/peer_create/up) are
- *   silently dropped by the host because no wlan_objmgr_vdev exists for
- *   the hidden vdev_id.
+ * A firmware-only STA helper has no object-manager vdev or MLME timer.
+ * Keep its response ownership separate from normal vdev response handling.
+ * Lifecycle commands are serialized by g_inj_tx_mutex; the WMI event path
+ * only takes g_inj_rsp_lock and never waits for that mutex.
  */
+#define WMA_INJECTION_VDEV_RESPONSE_MS 1500
+
 struct wma_injection_tx_vdev {
-	bool created;
+	bool allocated;
+	bool created; /* START succeeded and peer-create command was submitted */
+	bool start_sent;
+	bool start_rejected;
+	bool peer_created;
+	bool peer_delete_sent;
+	bool stop_sent;
+	bool delete_sent;
 	uint8_t vdev_id;
 	uint8_t monitor_vdev_id;
 	uint32_t chanfreq;
 	uint8_t mac_addr[QDF_MAC_ADDR_SIZE];
 };
 
-static struct wma_injection_tx_vdev g_inj_tx_vdev;
+struct wma_injection_vdev_responses {
+	struct wlan_objmgr_psoc *psoc;
+	uint8_t vdev_id;
+	unsigned long pending;
+	uint32_t status[MLME_FW_ONLY_VDEV_EVENT_MAX];
+	struct completion done[MLME_FW_ONLY_VDEV_EVENT_MAX];
+};
 
-static void wma_injection_destroy_tx_vdev(tp_wma_handle wma);
+static struct wma_injection_tx_vdev g_inj_tx_vdev;
+static struct wma_injection_vdev_responses g_inj_rsp;
+static DEFINE_SPINLOCK(g_inj_rsp_lock);
+static DEFINE_MUTEX(g_inj_tx_mutex);
+static bool g_inj_tx_session_failed;
+
+static QDF_STATUS wma_injection_destroy_tx_vdev_locked(tp_wma_handle wma);
+static QDF_STATUS wma_injection_destroy_tx_vdev(tp_wma_handle wma);
+static void wma_injection_queue_node_free(struct wma_injection_queue_node *node);
+
+bool wma_injection_vdev_response(struct wlan_objmgr_psoc *psoc,
+	uint8_t vdev_id, enum mlme_fw_only_vdev_event event,
+	uint32_t fw_status)
+{
+	unsigned long flags;
+	bool owned;
+
+	if ((unsigned int)event >= MLME_FW_ONLY_VDEV_EVENT_MAX)
+		return false;
+
+	spin_lock_irqsave(&g_inj_rsp_lock, flags);
+	owned = psoc && g_inj_rsp.psoc == psoc &&
+		g_inj_rsp.vdev_id == vdev_id;
+	if (owned && (g_inj_rsp.pending & BIT(event))) {
+		g_inj_rsp.status[event] = fw_status;
+		g_inj_rsp.pending &= ~BIT(event);
+		complete(&g_inj_rsp.done[event]);
+	}
+	spin_unlock_irqrestore(&g_inj_rsp_lock, flags);
+
+	/* Consume only this PSOC's owned firmware-only helper responses. */
+	return owned;
+}
+
+static QDF_STATUS wma_injection_claim_responses(tp_wma_handle wma, uint8_t vdev_id)
+{
+	unsigned long flags;
+	int event;
+	QDF_STATUS status;
+
+	status = wlan_objmgr_psoc_try_get_ref(wma->psoc, WLAN_LEGACY_WMA_ID);
+	if (QDF_IS_STATUS_ERROR(status))
+		return status;
+	status = wlan_objmgr_psoc_reserve_fw_vdev_id(wma->psoc, vdev_id);
+	if (QDF_IS_STATUS_ERROR(status)) {
+		wlan_objmgr_psoc_release_ref(wma->psoc, WLAN_LEGACY_WMA_ID);
+		return status;
+	}
+
+	spin_lock_irqsave(&g_inj_rsp_lock, flags);
+	for (event = 0; event < MLME_FW_ONLY_VDEV_EVENT_MAX; event++) {
+		init_completion(&g_inj_rsp.done[event]);
+		g_inj_rsp.status[event] = 0;
+	}
+	g_inj_rsp.pending = 0;
+	g_inj_rsp.vdev_id = vdev_id;
+	g_inj_rsp.psoc = wma->psoc;
+	spin_unlock_irqrestore(&g_inj_rsp_lock, flags);
+	return QDF_STATUS_SUCCESS;
+}
+
+static void wma_injection_release_responses(void)
+{
+	struct wlan_objmgr_psoc *psoc;
+	uint8_t id;
+	unsigned long flags;
+
+	spin_lock_irqsave(&g_inj_rsp_lock, flags);
+	psoc = g_inj_rsp.psoc;
+	id = g_inj_rsp.vdev_id;
+	g_inj_rsp.psoc = NULL;
+	g_inj_rsp.pending = 0;
+	spin_unlock_irqrestore(&g_inj_rsp_lock, flags);
+	if (psoc) {
+		wlan_objmgr_psoc_release_fw_vdev_id(psoc, id);
+		wlan_objmgr_psoc_release_ref(psoc, WLAN_LEGACY_WMA_ID);
+	}
+}
+
+static void wma_injection_arm_response(enum mlme_fw_only_vdev_event event)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&g_inj_rsp_lock, flags);
+	reinit_completion(&g_inj_rsp.done[event]);
+	g_inj_rsp.pending |= BIT(event);
+	spin_unlock_irqrestore(&g_inj_rsp_lock, flags);
+}
+
+static QDF_STATUS
+wma_injection_wait_response(enum mlme_fw_only_vdev_event event)
+{
+	if (!wait_for_completion_timeout(&g_inj_rsp.done[event],
+			msecs_to_jiffies(WMA_INJECTION_VDEV_RESPONSE_MS))) {
+		wma_err("NHHELPER response timeout: vdev=%u event=%u; slot retained",
+			g_inj_tx_vdev.vdev_id, event);
+		return QDF_STATUS_E_TIMEOUT;
+	}
+
+	if (READ_ONCE(g_inj_rsp.status[event])) {
+		wma_err("NHHELPER firmware rejection: vdev=%u event=%u status=0x%08x",
+			g_inj_tx_vdev.vdev_id, event,
+			READ_ONCE(g_inj_rsp.status[event]));
+		return QDF_STATUS_E_FAILURE;
+	}
+
+	wma_info("NHHELPER response accepted: vdev=%u event=%u",
+		 g_inj_tx_vdev.vdev_id, event);
+	return QDF_STATUS_SUCCESS;
+}
 
 /**
  * wma_injection_reset_session_state() - Reset per-session static state
@@ -252,286 +366,333 @@ static void wma_injection_reset_session_state(void)
 	 */
 }
 
-/**
- * wma_injection_ensure_tx_vdev() - Ensure hidden AP vdev exists for TX
- * @wma: WMA handle
- * @mon_vdev_id: monitor vdev id
- * @chanfreq: operating channel frequency in MHz
- *
- * Creates (or re-creates on channel change) a firmware-only AP vdev that
- * is used as the TX endpoint for injected management frames.
- *
- * Return: QDF_STATUS_SUCCESS when the helper vdev is ready.
- */
 static QDF_STATUS
-wma_injection_ensure_tx_vdev(tp_wma_handle wma,
-			    uint8_t mon_vdev_id,
-			    uint32_t chanfreq,
-			    const uint8_t *client_mac)
+wma_injection_ensure_tx_vdev_locked(tp_wma_handle wma, uint8_t mon_vdev_id,
+				  uint32_t chanfreq)
 {
-	struct vdev_create_params vcreate;
-	struct vdev_start_params vstart;
-	struct peer_create_params pcreate;
+	struct vdev_create_params vcreate = {0};
+	struct vdev_start_params vstart = {0};
+	struct peer_create_params pcreate = {0};
+	struct wlan_objmgr_pdev *pdev;
+	struct vdev_mlme_obj *mon_mlme;
+	enum dfs_reg dfs_region;
 	uint8_t *mon_mac;
 	uint8_t inj_mac[QDF_MAC_ADDR_SIZE];
 	uint8_t vid = 0;
 	bool found = false;
-	int i;
 	QDF_STATUS status;
+	int fw_max_vid, i;
 
-	if (g_inj_tx_vdev.created) {
-		/* NH helper client identity experiment */
-		if (g_inj_tx_vdev.chanfreq == chanfreq &&
-		    g_inj_tx_vdev.monitor_vdev_id == mon_vdev_id &&
-		    (!client_mac ||
-		     !qdf_mem_cmp(g_inj_tx_vdev.mac_addr, client_mac,
-				  QDF_MAC_ADDR_SIZE)))
-			return QDF_STATUS_SUCCESS;
-		/* Channel changed – tear down and recreate */
-		wma_injection_destroy_tx_vdev(wma);
+	if (g_inj_tx_session_failed)
+		return QDF_STATUS_E_FAILURE;
+
+	if (g_inj_tx_vdev.created &&
+	    g_inj_tx_vdev.chanfreq == chanfreq &&
+	    g_inj_tx_vdev.monitor_vdev_id == mon_vdev_id)
+		return QDF_STATUS_SUCCESS;
+
+	if (g_inj_tx_vdev.allocated) {
+		status = wma_injection_destroy_tx_vdev_locked(wma);
+		if (QDF_IS_STATUS_ERROR(status))
+			goto fail_session;
 	}
 
-	/*
-	 * Firmware vdev array supports IDs 0..(num_vdevs-1).  num_vdevs is
-	 * at most CFG_TGT_NUM_VDEV (typically 4) and may be decremented by 1
-	 * for NAN → 3.  Use (CFG_TGT_NUM_VDEV - 2) as safe ceiling so we
-	 * never exceed the firmware's internal array.
-	 */
-	{
-		int fw_max_vid = CFG_TGT_NUM_VDEV - 2;
+	/* Require acknowledged teardown before a firmware slot can be reused. */
+	if (!wmi_service_enabled(wma->wmi_handle, wmi_service_sync_delete_cmds)) {
+		wma_err("NHHELPER requires firmware sync-delete support");
+		status = QDF_STATUS_E_NOSUPPORT;
+		goto fail_session;
+	}
 
-		if (fw_max_vid >= (int)wma->max_bssid)
-			fw_max_vid = (int)wma->max_bssid - 1;
-		for (i = fw_max_vid; i >= 0; i--) {
-			if ((uint8_t)i == mon_vdev_id)
-				continue;
-			if (!wma->interfaces[i].vdev) {
-				vid = (uint8_t)i;
-				found = true;
-				break;
-			}
+	fw_max_vid = CFG_TGT_NUM_VDEV - 2;
+	if (fw_max_vid >= (int)wma->max_bssid)
+		fw_max_vid = (int)wma->max_bssid - 1;
+	for (i = fw_max_vid; i >= 0; i--) {
+		if ((uint8_t)i != mon_vdev_id && !wma->interfaces[i].vdev) {
+			vid = i;
+			found = true;
+			break;
 		}
 	}
 	if (!found) {
-		wma_err("Injection: no unused vdev slot for TX helper");
-		return QDF_STATUS_E_RESOURCES;
+		status = QDF_STATUS_E_RESOURCES;
+		goto fail_session;
 	}
 
-	/* New vdev being created — reset session state for a clean start */
-	wma_injection_reset_session_state();
-
-	mon_mac = wlan_vdev_mlme_get_macaddr(
-			wma->interfaces[mon_vdev_id].vdev);
+	mon_mac = wlan_vdev_mlme_get_macaddr(wma->interfaces[mon_vdev_id].vdev);
 	if (!mon_mac) {
-		wma_err("Injection: cannot read monitor vdev MAC");
-		return QDF_STATUS_E_FAILURE;
+		status = QDF_STATUS_E_FAILURE;
+		goto fail_session;
 	}
-	if (client_mac) {
-		qdf_mem_copy(inj_mac, client_mac, QDF_MAC_ADDR_SIZE);
-		wma_info("NHCLIENT helper identity: monitor=%u client=%pM freq=%u",
-			 mon_vdev_id, inj_mac, chanfreq);
-	} else {
-		qdf_mem_copy(inj_mac, mon_mac, QDF_MAC_ADDR_SIZE);
-		inj_mac[0] |= 0x02; /* locally-administered */
-	}
+	/* Use a distinct, stable transport identity; retain frame source addresses. */
+	qdf_mem_copy(inj_mac, mon_mac, QDF_MAC_ADDR_SIZE);
+	inj_mac[0] = (inj_mac[0] | 0x02) & ~0x01;
+	inj_mac[QDF_MAC_ADDR_SIZE - 1] ^= vid + 1;
+	for (i = 0; i < (int)wma->max_bssid; i++) {
+		uint8_t *active_mac;
 
-	/* ---------- 1. VDEV CREATE (STA type) ---------- */
-	/*
-	 * Use STA, not AP.  AP vdevs trigger firmware beacon-TX-offload
-	 * which crashes at _wlan_beacon_tx_offload_handle_beacon because
-	 * no beacon template exists.  STA vdevs reach the same peer-lookup
-	 * → WAL-TX path in the firmware mgmt TX handler without beacons.
-	 */
-	qdf_mem_zero(&vcreate, sizeof(vcreate));
-	vcreate.vdev_id = vid;
-	vcreate.type    = WMI_VDEV_TYPE_STA;
-	vcreate.subtype = 0;
-	vcreate.nss_2g  = 1;
-	vcreate.nss_5g  = 1;
-	vcreate.pdev_id = 0;
-
-	status = wmi_unified_vdev_create_send(wma->wmi_handle,
-					      inj_mac, &vcreate);
-	if (QDF_IS_STATUS_ERROR(status)) {
-		wma_err("Injection TX vdev create failed: %d", status);
-		return status;
-	}
-	/* Firmware processes WMI commands asynchronously.  Each step must
-	 * complete in firmware before the next command references the vdev.
-	 * Without these sleeps the mgmt-TX arrives before VDEV_CREATE is
-	 * done and firmware asserts in wlan_vdev_find_vdev.
-	 */
-	msleep(150);
-
-	/* ---------- 2. VDEV START (20 MHz basic mode) ---------- */
-	qdf_mem_zero(&vstart, sizeof(vstart));
-	vstart.vdev_id            = vid;
-	vstart.channel.mhz        = chanfreq;
-	vstart.channel.cfreq1     = chanfreq;
-	vstart.channel.cfreq2     = 0;
-	/* 2.4 GHz → MODE_11G(1), 5 GHz → MODE_11A(0) */
-	vstart.channel.phy_mode   = (chanfreq < 4000) ? 1 : 0;
-	vstart.channel.maxregpower = 20;
-	vstart.channel.maxpower    = 20;
-	vstart.beacon_interval    = 0;
-	vstart.dtim_period        = 0;
-
-	status = wmi_unified_vdev_start_send(wma->wmi_handle, &vstart);
-	if (QDF_IS_STATUS_ERROR(status)) {
-		wma_err("Injection TX vdev start failed: %d", status);
-		goto err_stop;
-	}
-	msleep(150);
-
-	/* ---------- 3. PEER CREATE (self-peer → fw vdev+0xc) ---------- */
-	qdf_mem_zero(&pcreate, sizeof(pcreate));
-	pcreate.peer_addr = inj_mac;
-	pcreate.peer_type = WMI_PEER_TYPE_DEFAULT;
-	pcreate.vdev_id   = vid;
-
-	status = wmi_unified_peer_create_send(wma->wmi_handle, &pcreate);
-	if (QDF_IS_STATUS_ERROR(status)) {
-		wma_err("Injection TX vdev peer create failed: %d", status);
-		goto err_stop;
-	}
-	msleep(100);
-
-	/*
-	 * Skip VDEV_UP.  For STA vdevs, firmware's wlan_vdev_up
-	 * asserts unless a BSS peer (the AP) exists — we only have
-	 * a self-peer.  The mgmt TX handler only needs the vdev in
-	 * STARTED state with a valid peer at vdev+0xc.
-	 */
-
-	g_inj_tx_vdev.created          = true;
-	g_inj_tx_vdev.vdev_id          = vid;
-	g_inj_tx_vdev.monitor_vdev_id  = mon_vdev_id;
-	g_inj_tx_vdev.chanfreq         = chanfreq;
-	qdf_mem_copy(g_inj_tx_vdev.mac_addr, inj_mac, QDF_MAC_ADDR_SIZE);
-
-	wma_info("Injection TX helper vdev created: vdev_id=%u mac=%pM freq=%u type=STA",
-		 vid, inj_mac, chanfreq);
-	return QDF_STATUS_SUCCESS;
-
-err_stop:
-	wmi_unified_vdev_delete_send(wma->wmi_handle, vid);
-	return status;
-}
-
-/**
- * wma_injection_destroy_tx_vdev() - Tear down the hidden injection TX vdev
- * @wma: WMA handle
- *
- * Late-path teardown (called from deinit_injection_queue / wma_close).
- * WMI may already be stopped, so failures are tolerated.
- */
-static void wma_injection_destroy_tx_vdev(tp_wma_handle wma)
-{
-	if (!g_inj_tx_vdev.created || !wma || !wma->wmi_handle)
-		return;
-
-	/*
-	 * Proper teardown order (reverse of create):
-	 *   PEER_DELETE → VDEV_STOP → VDEV_DELETE
-	 * Each step needs a sleep so firmware finishes processing
-	 * before the next command arrives.  Without this, a
-	 * subsequent VDEV_CREATE for the same slot races with the
-	 * pending DELETE and firmware asserts.
-	 */
-
-	/* 1. PEER_DELETE */
-	wmi_unified_peer_delete_send(wma->wmi_handle,
-				     g_inj_tx_vdev.mac_addr,
-				     g_inj_tx_vdev.vdev_id);
-	msleep(100);
-
-	/* 2. VDEV_STOP (we did VDEV_START during create) */
-	wmi_unified_vdev_stop_send(wma->wmi_handle,
-				   g_inj_tx_vdev.vdev_id);
-	msleep(100);
-
-	/* 3. VDEV_DELETE */
-	wmi_unified_vdev_delete_send(wma->wmi_handle,
-				     g_inj_tx_vdev.vdev_id);
-	msleep(100);
-
-	wma_info("Injection TX helper vdev destroyed: vdev_id=%u",
-		 g_inj_tx_vdev.vdev_id);
-	qdf_mem_zero(&g_inj_tx_vdev, sizeof(g_inj_tx_vdev));
-}
-
-/**
- * wma_injection_pre_stop_cleanup() - Destroy injection helper vdev before
- *                                     monitor mode stop
- * @wma_handle: WMA handle
- *
- * Must be called while WMI is still alive, BEFORE the driver sends
- * VDEV_STOP / VDEV_DELETE for the monitor vdev.  The firmware asserts
- * in dispatch_wlan_pdev_cmds if an orphaned STA helper vdev is still
- * present when the monitor vdev is torn down.
- *
- * Proper teardown order (reverse of create):
- *   PEER_DELETE → VDEV_STOP → VDEV_DELETE
- * with msleep() gaps so the firmware can process each command.
- */
-void wma_injection_pre_stop_cleanup(tp_wma_handle wma_handle)
-{
-	if (!wma_handle) {
-		wma_err("Invalid WMA handle for pre-stop cleanup");
-		return;
-	}
-
-	/*
-	 * Singularity injection TX quiescing:
-	 * stop admission, then wait for work that could submit WMI TX.
-	 */
-	{
-		struct wma_injection_queue_ctx *ctx =
-			&g_wma_injection_ctx;
-
-		if (ctx->is_initialized) {
-			qdf_spin_lock_bh(&ctx->queue_lock);
-			ctx->quiescing = true;
-			qdf_spin_unlock_bh(&ctx->queue_lock);
-
-			qdf_delayed_work_stop_sync(&ctx->delayed_work);
-			qdf_cancel_work(&ctx->queue_work);
-			qdf_flush_work(&ctx->queue_work);
+		if (!wma->interfaces[i].vdev)
+			continue;
+		active_mac = wlan_vdev_mlme_get_macaddr(wma->interfaces[i].vdev);
+		if (active_mac && !qdf_mem_cmp(inj_mac, active_mac,
+					     QDF_MAC_ADDR_SIZE)) {
+			wma_err("NHHELPER MAC conflicts with active vdev %d", i);
+			status = QDF_STATUS_E_INVAL;
+			goto fail_session;
 		}
 	}
 
-	if (!g_inj_tx_vdev.created)
-		return;
+	/* Mirror the normal START path's regulatory and stream initialization. */
+	pdev = wlan_vdev_get_pdev(wma->interfaces[mon_vdev_id].vdev);
+	mon_mlme = wlan_vdev_mlme_get_cmpt_obj(
+					wma->interfaces[mon_vdev_id].vdev);
+	if (!pdev || !mon_mlme) {
+		status = QDF_STATUS_E_INVAL;
+		goto fail_session;
+	}
+	status = wlan_reg_get_dfs_region(pdev, &dfs_region);
+	if (QDF_IS_STATUS_ERROR(status))
+		goto fail_session;
+	vstart.regdomain = dfs_region;
+	vstart.preferred_tx_streams = 1;
+	vstart.preferred_rx_streams = 1;
+	vstart.beacon_interval = mon_mlme->proto.generic.beacon_interval;
+	if (!vstart.beacon_interval)
+		vstart.beacon_interval = 100;
+	vstart.dtim_period = mon_mlme->proto.generic.dtim_period;
+	if (!vstart.dtim_period)
+		vstart.dtim_period = 1;
 
-	if (!wma_handle->wmi_handle) {
-		/* WMI already gone – just clear host state */
-		wma_warn("WMI down, clearing injection vdev state only");
+	wma_injection_reset_session_state();
+	g_inj_tx_vdev.vdev_id = vid;
+	g_inj_tx_vdev.monitor_vdev_id = mon_vdev_id;
+	g_inj_tx_vdev.chanfreq = chanfreq;
+	qdf_mem_copy(g_inj_tx_vdev.mac_addr, inj_mac, QDF_MAC_ADDR_SIZE);
+	status = wma_injection_claim_responses(wma, vid);
+	if (QDF_IS_STATUS_ERROR(status)) {
 		qdf_mem_zero(&g_inj_tx_vdev, sizeof(g_inj_tx_vdev));
-		return;
+		goto fail_session;
 	}
 
-	wma_info("Pre-stop cleanup: destroying injection helper vdev_id=%u",
-		 g_inj_tx_vdev.vdev_id);
+	vcreate.vdev_id = vid;
+	vcreate.type = WMI_VDEV_TYPE_STA;
+	vcreate.nss_2g = 1;
+	vcreate.nss_5g = 1;
+	vcreate.pdev_id = wlan_objmgr_pdev_get_pdev_id(pdev);
+	status = wmi_unified_vdev_create_send(wma->wmi_handle, inj_mac, &vcreate);
+	if (QDF_IS_STATUS_ERROR(status)) {
+		wma_injection_release_responses();
+		qdf_mem_zero(&g_inj_tx_vdev, sizeof(g_inj_tx_vdev));
+		goto fail_session;
+	}
+	g_inj_tx_vdev.allocated = true;
+	/* This firmware path has no create-confirmation callback. */
+	msleep(150);
 
-	/* 1. PEER_DELETE */
-	wmi_unified_peer_delete_send(wma_handle->wmi_handle,
-				     g_inj_tx_vdev.mac_addr,
-				     g_inj_tx_vdev.vdev_id);
+	vstart.vdev_id = vid;
+	vstart.channel.mhz = chanfreq;
+	vstart.channel.cfreq1 = chanfreq;
+	vstart.channel.phy_mode = chanfreq < 4000 ?
+				      WLAN_PHYMODE_11G : WLAN_PHYMODE_11A;
+	vstart.channel.maxregpower = 20;
+	vstart.channel.maxpower = 20;
+	wma_injection_arm_response(MLME_FW_ONLY_VDEV_START);
+	wma_info("NHHELPER START config: vdev=%u pdev=%u freq=%u mode=%u txss=%u rxss=%u regd=%u beacon=%u dtim=%u",
+		 vid, vcreate.pdev_id, chanfreq, vstart.channel.phy_mode,
+		 vstart.preferred_tx_streams, vstart.preferred_rx_streams,
+		 vstart.regdomain, vstart.beacon_interval, vstart.dtim_period);
+	status = wmi_unified_vdev_start_send(wma->wmi_handle, &vstart);
+	if (QDF_IS_STATUS_ERROR(status))
+		goto failed_start;
+	g_inj_tx_vdev.start_sent = true;
+	status = wma_injection_wait_response(MLME_FW_ONLY_VDEV_START);
+	if (QDF_IS_STATUS_ERROR(status)) {
+		g_inj_tx_vdev.start_rejected = status != QDF_STATUS_E_TIMEOUT;
+		goto failed_start;
+	}
+
+	pcreate.peer_addr = inj_mac;
+	pcreate.peer_type = WMI_PEER_TYPE_DEFAULT;
+	pcreate.vdev_id = vid;
+	status = wmi_unified_peer_create_send(wma->wmi_handle, &pcreate);
+	if (QDF_IS_STATUS_ERROR(status))
+		goto failed_start;
+	g_inj_tx_vdev.peer_created = true;
+	/* Keep the existing peer-create settling interval. */
 	msleep(100);
 
-	/* 2. VDEV_STOP (we did VDEV_START during create) */
-	wmi_unified_vdev_stop_send(wma_handle->wmi_handle,
-				   g_inj_tx_vdev.vdev_id);
-	msleep(100);
+	/* Do not send STA VDEV_UP without a BSS peer. */
+	g_inj_tx_vdev.created = true;
+	wma_info("NHHELPER ready: vdev=%u monitor=%u mac=%pM freq=%u",
+		 vid, mon_vdev_id, inj_mac, chanfreq);
+	return QDF_STATUS_SUCCESS;
 
-	/* 3. VDEV_DELETE */
-	wmi_unified_vdev_delete_send(wma_handle->wmi_handle,
-				     g_inj_tx_vdev.vdev_id);
-	msleep(100);
+failed_start:
+	/* Preserve the setup error even if cleanup also fails. */
+	wma_injection_destroy_tx_vdev_locked(wma);
+fail_session:
+	g_inj_tx_session_failed = true;
+	wma_err("NHHELPER setup blocked for this session: status=%d; stop/start monitor to retry",
+		status);
+	return status;
+}
 
-	wma_info("Pre-stop cleanup: injection helper vdev destroyed: vdev_id=%u",
-		 g_inj_tx_vdev.vdev_id);
+static QDF_STATUS
+wma_injection_ensure_tx_vdev(tp_wma_handle wma, uint8_t mon_vdev_id,
+			    uint32_t chanfreq)
+{
+	QDF_STATUS status;
+
+	mutex_lock(&g_inj_tx_mutex);
+	status = wma_injection_ensure_tx_vdev_locked(wma, mon_vdev_id,
+						 chanfreq);
+	mutex_unlock(&g_inj_tx_mutex);
+	return status;
+}
+
+static QDF_STATUS wma_injection_destroy_tx_vdev_locked(tp_wma_handle wma)
+{
+	QDF_STATUS status;
+	uint8_t vid = g_inj_tx_vdev.vdev_id;
+
+	if (!g_inj_tx_vdev.allocated)
+		return QDF_STATUS_SUCCESS;
+	if (!wma || !wma->wmi_handle)
+		return QDF_STATUS_E_FAILURE;
+
+	g_inj_tx_vdev.created = false;
+	if (g_inj_tx_vdev.peer_created) {
+		if (!g_inj_tx_vdev.peer_delete_sent) {
+			wma_injection_arm_response(MLME_FW_ONLY_PEER_DELETE);
+			status = wmi_unified_peer_delete_send(wma->wmi_handle,
+					g_inj_tx_vdev.mac_addr, vid);
+			if (QDF_IS_STATUS_ERROR(status))
+				return status;
+			g_inj_tx_vdev.peer_delete_sent = true;
+		}
+		status = wma_injection_wait_response(MLME_FW_ONLY_PEER_DELETE);
+		if (QDF_IS_STATUS_ERROR(status))
+			return status;
+		g_inj_tx_vdev.peer_created = false;
+	}
+
+	if (g_inj_tx_vdev.start_sent && !g_inj_tx_vdev.start_rejected) {
+		if (!g_inj_tx_vdev.stop_sent) {
+			wma_injection_arm_response(MLME_FW_ONLY_VDEV_STOP);
+			status = wmi_unified_vdev_stop_send(wma->wmi_handle, vid);
+			if (QDF_IS_STATUS_ERROR(status))
+				return status;
+			g_inj_tx_vdev.stop_sent = true;
+		}
+		status = wma_injection_wait_response(MLME_FW_ONLY_VDEV_STOP);
+		if (QDF_IS_STATUS_ERROR(status))
+			return status;
+		g_inj_tx_vdev.start_sent = false;
+	}
+
+	if (!g_inj_tx_vdev.delete_sent) {
+		wma_injection_arm_response(MLME_FW_ONLY_VDEV_DELETE);
+		status = wmi_unified_vdev_delete_send(wma->wmi_handle, vid);
+		if (QDF_IS_STATUS_ERROR(status))
+			return status;
+		g_inj_tx_vdev.delete_sent = true;
+	}
+	status = wma_injection_wait_response(MLME_FW_ONLY_VDEV_DELETE);
+	if (QDF_IS_STATUS_ERROR(status))
+		return status;
+
+	wma_injection_release_responses();
 	qdf_mem_zero(&g_inj_tx_vdev, sizeof(g_inj_tx_vdev));
+	wma_info("NHHELPER teardown confirmed: vdev=%u", vid);
+	return QDF_STATUS_SUCCESS;
+}
+
+static QDF_STATUS wma_injection_destroy_tx_vdev(tp_wma_handle wma)
+{
+	QDF_STATUS status;
+
+	mutex_lock(&g_inj_tx_mutex);
+	status = wma_injection_destroy_tx_vdev_locked(wma);
+	if (QDF_IS_STATUS_ERROR(status)) {
+		g_inj_tx_session_failed = true;
+		wma_err("NHHELPER teardown unresolved: vdev=%u status=%d; slot retained",
+			g_inj_tx_vdev.vdev_id, status);
+	}
+	mutex_unlock(&g_inj_tx_mutex);
+	return status;
+}
+
+static void wma_injection_purge_queue(struct wma_injection_queue_ctx *ctx)
+{
+	qdf_list_node_t *entry;
+	struct wma_injection_queue_node *node;
+
+	for (;;) {
+		qdf_spin_lock_bh(&ctx->queue_lock);
+		if (QDF_IS_STATUS_ERROR(qdf_list_remove_front(&ctx->queue, &entry))) {
+			qdf_spin_unlock_bh(&ctx->queue_lock);
+			break;
+		}
+		ctx->queue_size--;
+		qdf_spin_unlock_bh(&ctx->queue_lock);
+		node = qdf_container_of(entry, struct wma_injection_queue_node, node);
+		wma_injection_queue_node_free(node);
+		ctx->stats.frames_dropped++;
+	}
+}
+
+void wma_injection_pre_stop_cleanup(tp_wma_handle wma)
+{
+	struct wma_injection_queue_ctx *ctx = &g_wma_injection_ctx;
+
+	if (!wma || !ctx->is_initialized)
+		return;
+
+	qdf_spin_lock_bh(&ctx->queue_lock);
+	ctx->quiescing = true;
+	qdf_spin_unlock_bh(&ctx->queue_lock);
+	qdf_delayed_work_stop_sync(&ctx->delayed_work);
+	qdf_cancel_work(&ctx->queue_work);
+	qdf_flush_work(&ctx->queue_work);
+	wma_injection_purge_queue(ctx);
+	wma_injection_destroy_tx_vdev(wma);
+}
+
+QDF_STATUS wma_injection_resume(tp_wma_handle wma)
+{
+	struct wma_injection_queue_ctx *ctx = &g_wma_injection_ctx;
+	QDF_STATUS status = QDF_STATUS_SUCCESS;
+
+	if (!wma || !ctx->is_initialized)
+		return QDF_STATUS_E_AGAIN;
+
+	mutex_lock(&g_inj_tx_mutex);
+	if (!READ_ONCE(ctx->quiescing))
+		goto out;
+
+	/* Retry only cleanup, never reuse an unresolved firmware helper ID. */
+	status = wma_injection_destroy_tx_vdev_locked(wma);
+	if (QDF_IS_STATUS_ERROR(status))
+		goto out;
+
+	g_inj_tx_session_failed = false;
+	qdf_spin_lock_bh(&ctx->queue_lock);
+	ctx->quiescing = false;
+	qdf_spin_unlock_bh(&ctx->queue_lock);
+	wma_info("NHHELPER injection session resumed");
+out:
+	mutex_unlock(&g_inj_tx_mutex);
+	return status;
+}
+
+/* WMI has been detached; no event can still reference this ownership. */
+void wma_injection_fw_detached(void)
+{
+	mutex_lock(&g_inj_tx_mutex);
+	wma_injection_release_responses();
+	qdf_mem_zero(&g_inj_tx_vdev, sizeof(g_inj_tx_vdev));
+	g_inj_tx_session_failed = false;
+	mutex_unlock(&g_inj_tx_mutex);
 }
 
 static bool
@@ -887,7 +1048,7 @@ QDF_STATUS wma_process_injection_queue(tp_wma_handle wma_handle)
 			ctx->stats.frames_processed++;
 		} else {
 			ctx->stats.frames_dropped++;
-			wma_err("Failed to send injection frame to firmware: %d", status);
+			wma_err_rl("Failed to send injection frame to firmware: %d", status);
 		}
 
 		processed_count++;
@@ -1087,6 +1248,7 @@ QDF_STATUS wma_init_injection_queue(tp_wma_handle wma_handle)
 	}
 	ctx->quiescing = false;
 	ctx->is_initialized = true;
+	g_inj_tx_session_failed = false;
 
 	/* Arm the reaper */
 	qdf_delayed_work_start(&ctx->reaper_work,
@@ -1611,37 +1773,17 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 		 * to a beacon-only path → DISCARD).  Route through a hidden
 		 * AP vdev instead, which the FW accepts for mgmt TX.
 		 */
-		{
-			const uint8_t *client_mac = NULL;
-
-			/*
-			 * Bind only to a unicast source of an open-system
-			 * authentication request (transaction sequence 1).
-			 * Other injected frame types retain the current identity.
-			 */
-			if (req->frame_len >= 30 &&
-			    (frame_data[0] & 0xfc) == 0xb0 &&
-			    !(frame_data[10] & 1) &&
-			    (frame_data[10] | frame_data[11] |
-			     frame_data[12] | frame_data[13] |
-			     frame_data[14] | frame_data[15]) &&
-			    frame_data[24] == 0 && frame_data[25] == 0 &&
-			    frame_data[26] == 1 && frame_data[27] == 0 &&
-			    frame_data[28] == 0 && frame_data[29] == 0)
-				client_mac = frame_data + 10;
-
-			status = wma_injection_ensure_tx_vdev(wma_handle,
-					vdev_id, tx_chanfreq, client_mac);
-		}
+		status = wma_injection_ensure_tx_vdev(wma_handle,
+						vdev_id, tx_chanfreq);
 		if (QDF_IS_STATUS_ERROR(status)) {
-			wma_err("Failed to create injection TX helper vdev: %d",
+			wma_err_rl("Failed to create injection TX helper vdev: %d",
 				status);
 			qdf_nbuf_free(wmi_buf);
 			return status;
 		}
 		mgmt_params.vdev_id = g_inj_tx_vdev.vdev_id;
 		if (!inject_monitor_no_legacy_logged) {
-			wma_warn("Injection monitor: using hidden AP vdev %u for TX (monitor vdev %u)",
+			wma_warn("Injection monitor: using helper STA vdev %u for TX (monitor vdev %u)",
 				 g_inj_tx_vdev.vdev_id, vdev_id);
 			inject_monitor_no_legacy_logged = true;
 		}

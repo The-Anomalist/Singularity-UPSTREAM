@@ -26,6 +26,7 @@
 
 #include "wma.h"
 #include "wma_api.h"
+#include "wma_frame_inject.h"
 #include "cds_api.h"
 #include "wmi_unified_api.h"
 #include "wlan_qct_sys.h"
@@ -1137,6 +1138,12 @@ QDF_STATUS wma_handle_channel_switch_resp(tp_wma_handle wma,
 	iface = &wma->interfaces[rsp->vdev_id];
 	WMA_LOGD("%s: Send channel switch resp vdev %d status %d",
 		 __func__, rsp->vdev_id, rsp->status);
+
+	if (iface->type == WMI_VDEV_TYPE_MONITOR)
+		WMA_LOGI("NHMON response: vdev=%u type=%u status=%d state=%u substate=%u",
+			 rsp->vdev_id, rsp->resp_type, rsp->status,
+			 wlan_vdev_mlme_get_state(iface->vdev),
+			 wlan_vdev_mlme_get_substate(iface->vdev));
 
 	/* Indicate channel switch failure to LIM */
 	if (QDF_IS_STATUS_ERROR(rsp->status) &&
@@ -3052,6 +3059,10 @@ int wma_peer_delete_handler(void *handle, uint8_t *cmd_param_info,
 		WMA_LOGE("Invalid vdev delete event buffer");
 		return -EINVAL;
 	}
+
+	if (wma_injection_vdev_response(wma->psoc, event->vdev_id,
+					MLME_FW_ONLY_PEER_DELETE, 0))
+		return 0;
 
 	WMI_MAC_ADDR_TO_CHAR_ARRAY(&event->peer_macaddr, macaddr);
 	WMA_LOGD(FL("Peer Delete Response, vdev %d Peer "QDF_MAC_ADDR_FMT),
