@@ -111,6 +111,7 @@ irqreturn_t handle_irq_event(struct irq_desc *desc);
 void check_irq_resend(struct irq_desc *desc);
 bool irq_wait_for_poll(struct irq_desc *desc);
 void __irq_wake_thread(struct irq_desc *desc, struct irqaction *action);
+void wake_threads_waitq(struct irq_desc *desc);
 
 #ifdef CONFIG_PROC_FS
 extern void register_irq_proc(unsigned int irq, struct irq_desc *desc);
