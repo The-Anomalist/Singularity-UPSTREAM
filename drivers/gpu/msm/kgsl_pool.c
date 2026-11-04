@@ -521,30 +521,43 @@ static unsigned long
 kgsl_pool_shrink_scan_objects(struct shrinker *shrinker,
 					struct shrink_control *sc)
 {
-	/* nr represents number of pages to be removed*/
-	int nr = sc->nr_to_scan;
-	int total_pages = kgsl_pool_size_total();
-	unsigned long ret;
+	unsigned long freed = 0;
+	int i;
 
-	/* Target pages represents new  pool size */
-	int target_pages = (nr > total_pages) ? 0 : (total_pages - nr);
+	/* Reclaim against the remaining budget as pool sizes change. */
+	for (i = kgsl_num_pools - 1; i >= 0 && freed < sc->nr_to_scan; i--) {
+		struct kgsl_page_pool *pool = &kgsl_pools[i];
+		unsigned long nr;
 
-	/* Reduce pool size to target_pages */
-	ret = kgsl_pool_reduce(target_pages, false);
+		if (!pool->allocation_allowed)
+			continue;
 
-	/* If we are unable to shrink more, stop trying */
-	return (ret == 0) ? SHRINK_STOP : ret;
+		nr = min_t(unsigned long, sc->nr_to_scan - freed,
+			   kgsl_pool_size(pool));
+		/* Free whole compound pages. */
+		nr = ALIGN(nr, 1UL << pool->pool_order);
+		freed += _kgsl_pool_shrink(pool, nr);
+	}
+
+	return freed ? freed : SHRINK_STOP;
 }
 
 static unsigned long
 kgsl_pool_shrink_count_objects(struct shrinker *shrinker,
 					struct shrink_control *sc)
 {
+	unsigned long count = 0;
+	int i;
+
 	/* Trigger mem_workqueue flush to free memory */
 	kgsl_schedule_work(&kgsl_driver.mem_work);
 
-	/* Return total pool size as everything in pool can be freed */
-	return kgsl_pool_size_total();
+	for (i = 0; i < kgsl_num_pools; i++) {
+		if (kgsl_pools[i].allocation_allowed)
+			count += kgsl_pool_size(&kgsl_pools[i]);
+	}
+
+	return count ? count : SHRINK_EMPTY;
 }
 
 /* Shrinker callback data*/
