@@ -179,19 +179,32 @@ static u32 orion_percent(u64 busy, u64 total)
 	return min_t(u64, 100, div64_u64(busy * 100, total));
 }
 
-/* Return the fastest level needed for an observed demand percentage. */
-static int orion_demand_level(struct devfreq *devfreq, u32 demand)
+/* Map utilization at the measured clock onto the descending OPP table. */
+static int orion_demand_level(struct devfreq *devfreq, int current_level,
+		u32 demand)
 {
 	u32 levels = devfreq->profile->max_state;
+	u32 threshold = max_t(u32, 1, READ_ONCE(orion.up_threshold));
+	u64 required;
+	int level;
 
 	if (levels < 2)
 		return 0;
 
-	return div_u64((u64)(100 - min(demand, 100U)) * (levels - 1) + 50,
-			100);
+	required = (u64)devfreq->profile->freq_table[current_level] *
+		min(demand, 100U);
+	required = div_u64(required + threshold - 1, threshold);
+
+	/* Choose the slowest OPP which can cover the estimated demand. */
+	for (level = levels - 1; level > 0; level--)
+		if (devfreq->profile->freq_table[level] >= required)
+			return level;
+
+	return 0;
 }
 
-static int orion_refine_target(struct devfreq *devfreq, int tz_level,
+static int orion_refine_target(struct devfreq *devfreq, int current_level,
+		int tz_level,
 		u64 busy, u64 total, int context_count)
 {
 	u32 load = orion_percent(busy, total);
@@ -220,7 +233,7 @@ static int orion_refine_target(struct devfreq *devfreq, int tz_level,
 	if (context_count >= 4)
 		demand = min(100U, demand + 5);
 
-	adaptive_level = orion_demand_level(devfreq, demand);
+	adaptive_level = orion_demand_level(devfreq, current_level, demand);
 	if (demand >= orion.up_threshold)
 		target = min(target, adaptive_level);
 
@@ -230,18 +243,25 @@ static int orion_refine_target(struct devfreq *devfreq, int tz_level,
 		target = min(target, adaptive_level);
 	} else if (orion.boost_hold) {
 		orion.boost_hold--;
-		target = min_t(int, target, orion.last_level);
+		target = min(target, current_level);
 	}
 
-	/* Downscaling is deliberately slower than boosting to avoid frame jitter. */
+	/* Qualify every downscale against the actual clock, not a past request. */
 	if (demand <= orion.down_threshold && !orion.boost_hold) {
-		orion.low_load_samples++;
 		if (orion.low_load_samples < orion.down_samples)
-			target = min_t(int, target, orion.last_level);
-		else
+			orion.low_load_samples++;
+		if (orion.low_load_samples >= orion.down_samples)
 			target = max(target, adaptive_level);
 	} else {
 		orion.low_load_samples = 0;
+	}
+
+	if (target > current_level) {
+		if (orion.boost_hold ||
+		    orion.low_load_samples < orion.down_samples)
+			target = current_level;
+		else
+			target = min(target, current_level + 1);
 	}
 
 	target = clamp(target, 0, max_level);
@@ -605,7 +625,7 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq)
 	int result = 0;
 	struct devfreq_msm_adreno_tz_data *priv = devfreq->data;
 	struct devfreq_dev_status *stats = &devfreq->last_status;
-	int val, level = 0;
+	int val = 0, level = 0, current_level;
 	u64 sample_busy, sample_total;
 	unsigned int scm_data[4];
 	int context_count = 0;
@@ -633,6 +653,8 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq)
 		return level;
 	}
 
+	current_level = level;
+
 	/*
 	 * Do not waste CPU cycles running this algorithm if
 	 * the GPU just started, or if less than FLOOR time
@@ -652,8 +674,8 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq)
 		sample_busy = priv->bin.busy_time;
 		priv->bin.total_time = 0;
 		priv->bin.busy_time = 0;
-		level = orion_refine_target(devfreq, level, sample_busy,
-					    sample_total, context_count);
+		level = orion_refine_target(devfreq, current_level, level,
+					    sample_busy, sample_total, context_count);
 		level = tz_apply_submit_boost(priv, level);
 		*freq = devfreq->profile->freq_table[level];
 		return 0;
@@ -678,8 +700,10 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq)
 		else
 			scm_data[2] = priv->bin.busy_time;
 		scm_data[3] = context_count;
-		__secure_tz_update_entry3(scm_data, sizeof(scm_data),
+		result = __secure_tz_update_entry3(scm_data, sizeof(scm_data),
 					&val, sizeof(val), priv);
+		if (result < 0)
+			val = 0;
 	}
 	sample_total = priv->bin.total_time;
 	sample_busy = priv->bin.busy_time;
@@ -702,8 +726,8 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq)
 	 * trend and queue pressure so interactive work ramps without waiting for
 	 * a full firmware control cycle, while sustained idle decays smoothly.
 	 */
-	level = orion_refine_target(devfreq, level, sample_busy, sample_total,
-				    context_count);
+	level = orion_refine_target(devfreq, current_level, level,
+				    sample_busy, sample_total, context_count);
 	*freq = devfreq->profile->freq_table[level];
 	return 0;
 }
@@ -831,7 +855,8 @@ static int tz_suspend(struct devfreq *devfreq)
 	struct devfreq_msm_adreno_tz_data *priv = devfreq->data;
 	unsigned int scm_data[2] = {0, 0};
 
-	__secure_tz_reset_entry2(scm_data, sizeof(scm_data), priv->is_64);
+	if (priv->tz_available)
+		__secure_tz_reset_entry2(scm_data, sizeof(scm_data), priv->is_64);
 
 	priv->bin.total_time = 0;
 	priv->bin.busy_time = 0;

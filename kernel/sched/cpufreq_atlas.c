@@ -395,7 +395,8 @@ static unsigned long sugov_map_util(struct sugov_policy *sg_policy,
 	 * avoids making global fabric floors or steady background CPU demand more
 	 * expensive merely to improve foreground UX.
 	 */
-	if (ux_burst)
+	/* RTG demand must not be reduced by the energy-saving curve below. */
+	if (latency_sensitive || ux_burst)
 		return util;
 
 	/*
