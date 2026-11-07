@@ -368,7 +368,8 @@ static void wma_injection_reset_session_state(void)
 
 static QDF_STATUS
 wma_injection_ensure_tx_vdev_locked(tp_wma_handle wma, uint8_t mon_vdev_id,
-				  uint32_t chanfreq)
+				  uint32_t chanfreq,
+				  const uint8_t *client_mac)
 {
 	struct vdev_create_params vcreate = {0};
 	struct vdev_start_params vstart = {0};
@@ -388,7 +389,10 @@ wma_injection_ensure_tx_vdev_locked(tp_wma_handle wma, uint8_t mon_vdev_id,
 
 	if (g_inj_tx_vdev.created &&
 	    g_inj_tx_vdev.chanfreq == chanfreq &&
-	    g_inj_tx_vdev.monitor_vdev_id == mon_vdev_id)
+	    g_inj_tx_vdev.monitor_vdev_id == mon_vdev_id &&
+	    (!client_mac ||
+	     !qdf_mem_cmp(g_inj_tx_vdev.mac_addr, client_mac,
+			  QDF_MAC_ADDR_SIZE)))
 		return QDF_STATUS_SUCCESS;
 
 	if (g_inj_tx_vdev.allocated) {
@@ -424,10 +428,14 @@ wma_injection_ensure_tx_vdev_locked(tp_wma_handle wma, uint8_t mon_vdev_id,
 		status = QDF_STATUS_E_FAILURE;
 		goto fail_session;
 	}
-	/* Use a distinct, stable transport identity; retain frame source addresses. */
-	qdf_mem_copy(inj_mac, mon_mac, QDF_MAC_ADDR_SIZE);
-	inj_mac[0] = (inj_mac[0] | 0x02) & ~0x01;
-	inj_mac[QDF_MAC_ADDR_SIZE - 1] ^= vid + 1;
+	/* Authentication TX must use the same identity as the helper self-peer. */
+	if (client_mac) {
+		qdf_mem_copy(inj_mac, client_mac, QDF_MAC_ADDR_SIZE);
+	} else {
+		qdf_mem_copy(inj_mac, mon_mac, QDF_MAC_ADDR_SIZE);
+		inj_mac[0] = (inj_mac[0] | 0x02) & ~0x01;
+		inj_mac[QDF_MAC_ADDR_SIZE - 1] ^= vid + 1;
+	}
 	for (i = 0; i < (int)wma->max_bssid; i++) {
 		uint8_t *active_mac;
 
@@ -479,7 +487,12 @@ wma_injection_ensure_tx_vdev_locked(tp_wma_handle wma, uint8_t mon_vdev_id,
 	vcreate.nss_2g = 1;
 	vcreate.nss_5g = 1;
 	vcreate.pdev_id = wlan_objmgr_pdev_get_pdev_id(pdev);
+	wma_warn("NHHELPER CREATE config: vdev=%u monitor=%u pdev=%u type=%u subtype=%u nss2g=%u nss5g=%u mac=%pM freq=%u",
+		 vid, mon_vdev_id, vcreate.pdev_id, vcreate.type,
+		 vcreate.subtype, vcreate.nss_2g, vcreate.nss_5g, inj_mac,
+		 chanfreq);
 	status = wmi_unified_vdev_create_send(wma->wmi_handle, inj_mac, &vcreate);
+	wma_warn("NHHELPER CREATE submit: vdev=%u status=%d", vid, status);
 	if (QDF_IS_STATUS_ERROR(status)) {
 		wma_injection_release_responses();
 		qdf_mem_zero(&g_inj_tx_vdev, sizeof(g_inj_tx_vdev));
@@ -506,6 +519,8 @@ wma_injection_ensure_tx_vdev_locked(tp_wma_handle wma, uint8_t mon_vdev_id,
 		goto failed_start;
 	g_inj_tx_vdev.start_sent = true;
 	status = wma_injection_wait_response(MLME_FW_ONLY_VDEV_START);
+	wma_warn("NHHELPER START result: vdev=%u status=%d fw_status=0x%08x",
+		 vid, status, READ_ONCE(g_inj_rsp.status[MLME_FW_ONLY_VDEV_START]));
 	if (QDF_IS_STATUS_ERROR(status)) {
 		g_inj_tx_vdev.start_rejected = status != QDF_STATUS_E_TIMEOUT;
 		goto failed_start;
@@ -515,6 +530,7 @@ wma_injection_ensure_tx_vdev_locked(tp_wma_handle wma, uint8_t mon_vdev_id,
 	pcreate.peer_type = WMI_PEER_TYPE_DEFAULT;
 	pcreate.vdev_id = vid;
 	status = wmi_unified_peer_create_send(wma->wmi_handle, &pcreate);
+	wma_warn("NHHELPER PEER submit: vdev=%u status=%d", vid, status);
 	if (QDF_IS_STATUS_ERROR(status))
 		goto failed_start;
 	g_inj_tx_vdev.peer_created = true;
@@ -539,13 +555,13 @@ fail_session:
 
 static QDF_STATUS
 wma_injection_ensure_tx_vdev(tp_wma_handle wma, uint8_t mon_vdev_id,
-			    uint32_t chanfreq)
+			    uint32_t chanfreq, const uint8_t *client_mac)
 {
 	QDF_STATUS status;
 
 	mutex_lock(&g_inj_tx_mutex);
 	status = wma_injection_ensure_tx_vdev_locked(wma, mon_vdev_id,
-						 chanfreq);
+						 chanfreq, client_mac);
 	mutex_unlock(&g_inj_tx_mutex);
 	return status;
 }
@@ -1768,13 +1784,26 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 	}
 
 	if (monitor_vdev) {
+		const uint8_t *client_mac = NULL;
+
 		/*
 		 * FW _wlan_send_mgmt_to_host rejects MONITOR vdevs (falls
 		 * to a beacon-only path → DISCARD).  Route through a hidden
-		 * AP vdev instead, which the FW accepts for mgmt TX.
+		 * STA vdev instead, which the FW accepts for mgmt TX.
 		 */
+		if (req->frame_len >= 30 &&
+		    (frame_data[0] & 0xfc) == 0xb0 &&
+		    !(frame_data[10] & 1) &&
+		    (frame_data[10] | frame_data[11] | frame_data[12] |
+		     frame_data[13] | frame_data[14] | frame_data[15]) &&
+		    frame_data[24] == 0 && frame_data[25] == 0 &&
+		    frame_data[26] == 1 && frame_data[27] == 0 &&
+		    frame_data[28] == 0 && frame_data[29] == 0)
+			client_mac = frame_data + 10;
+
 		status = wma_injection_ensure_tx_vdev(wma_handle,
-						vdev_id, tx_chanfreq);
+						vdev_id, tx_chanfreq,
+						client_mac);
 		if (QDF_IS_STATUS_ERROR(status)) {
 			wma_err_rl("Failed to create injection TX helper vdev: %d",
 				status);

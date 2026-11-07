@@ -49,6 +49,7 @@
 #include "wlan_hdd_hostapd.h"
 #include "wlan_hdd_softap_tx_rx.h"
 #include "wlan_hdd_main.h"
+#include <wlan_vdev_mlme_main.h>
 #include "wlan_hdd_power.h"
 #include "wlan_hdd_trace.h"
 #include "wlan_hdd_tx_rx.h"
@@ -24210,6 +24211,23 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 			chandef->chan->center_freq,
 			adapter->mon_chan_freq);
 		return -EBUSY;
+	}
+
+	/*
+	 * A repeated 20 MHz channel request needs no firmware restart once
+	 * monitor UP has completed. Preserve normal setup after a failure.
+	 */
+	if (adapter->vdev &&
+	    wlan_vdev_mlme_get_state(adapter->vdev) == WLAN_VDEV_S_UP &&
+	    !READ_ONCE(adapter->monitor_mode_vdev_failed) &&
+	    ch_width == CH_WIDTH_20MHZ &&
+	    adapter->mon_chan_freq == chandef->chan->center_freq &&
+	    adapter->mon_bandwidth == ch_width &&
+	    chandef->center_freq1 == chandef->chan->center_freq &&
+	    !chandef->center_freq2) {
+		hdd_warn("NHMON reuse: vdev=%u freq=%u width=%u",
+			 adapter->vdev_id, adapter->mon_chan_freq, ch_width);
+		return 0;
 	}
 
 	if (wlan_hdd_change_hw_mode_for_given_chnl(adapter,
