@@ -26,7 +26,7 @@
 #include "msm_gem.h"
 #include "msm_mmu.h"
 
-static unsigned int adreno_autosuspend_delay = 100; // Optimized for faster wake
+static unsigned int adreno_autosuspend_delay = 250;
 module_param_named(autosuspend_delay, adreno_autosuspend_delay, uint, 0644);
 MODULE_PARM_DESC(autosuspend_delay,
 		"minimum runtime PM autosuspend delay for Adreno GPU (ms)");

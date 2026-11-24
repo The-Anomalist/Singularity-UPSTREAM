@@ -19,34 +19,19 @@
 
 static atomic_t irq_migrate_cpu_hint = ATOMIC_INIT(-1);
 
-/**
- * irq_pick_migration_cpu - Select CPU for IRQ migration using round-robin
- *
- * This function distributes IRQs evenly across available CPUs to prevent
- * hot spots. Round-robin provides balanced distribution without needing
- * complex topology awareness since:
- * - Hardware MSI/MSI-X controllers often handle initial distribution  
- * - Simple balancing is more effective than complex topology tracking
- * - Overhead of complex checks exceeds benefits they provide
- */
 static int irq_pick_migration_cpu(const struct cpumask *mask)
 {
-	int start, count, cpu;
+	int start, cpu;
 
 	if (cpumask_empty(mask))
 		return nr_cpu_ids;
 
-	start = atomic_inc_return(&irq_migrate_cpu_hint);
-	count = cpumask_weight(mask);
+	start = atomic_inc_return(&irq_migrate_cpu_hint) % nr_cpu_ids;
+	cpu = cpumask_next_wrap(start - 1, mask, start, false);
+	if (cpu >= nr_cpu_ids)
+		cpu = cpumask_first(mask);
 
-	/* Find the nth CPU in the mask where n is our round-robin index */
-	for_each_set_bit(cpu, cpumask_bits(mask), count) {
-		if (--start < 0)
-			return cpu;
-	}
-
-	/* All CPUs in mask exhausted, return first */
-	return cpumask_first(mask);
+	return cpu;
 }
 
 /* For !GENERIC_IRQ_EFFECTIVE_AFF_MASK this looks at general affinity mask */
