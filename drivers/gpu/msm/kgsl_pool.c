@@ -51,6 +51,11 @@ struct kgsl_page_pool {
 static struct kgsl_page_pool kgsl_pools[KGSL_MAX_POOLS];
 static int kgsl_num_pools;
 static int kgsl_pool_max_pages;
+
+/* Singularity AGMM: GPU pool observability */
+static atomic64_t kgsl_pool_hits = ATOMIC64_INIT(0);
+static atomic64_t kgsl_pool_misses = ATOMIC64_INIT(0);
+static atomic64_t kgsl_pool_shrink_pages = ATOMIC64_INIT(0);
 /*
  * Allow high-order pool misses to spill to system allocation before
  * immediately degrading to lower-order pages.
@@ -163,6 +168,103 @@ static int kgsl_pool_size_total(void)
 		total += kgsl_pool_size(&kgsl_pools[i]);
 	return total;
 }
+
+
+/* Read-only GPU pool telemetry. All sizes are reported in bytes. */
+static int kgsl_pool_cached_get(char *buf,
+        const struct kernel_param *kp)
+{
+    return scnprintf(buf, PAGE_SIZE, "%llu\n",
+        (unsigned long long)kgsl_pool_size_total() << PAGE_SHIFT);
+}
+
+static int kgsl_pool_reclaimable_get(char *buf,
+        const struct kernel_param *kp)
+{
+    unsigned long long pages = 0;
+    int i;
+
+    for (i = 0; i < kgsl_num_pools; i++)
+        if (kgsl_pools[i].allocation_allowed)
+            pages += kgsl_pool_size(&kgsl_pools[i]);
+
+    return scnprintf(buf, PAGE_SIZE, "%llu\n",
+        pages << PAGE_SHIFT);
+}
+
+static int kgsl_pool_protected_get(char *buf,
+        const struct kernel_param *kp)
+{
+    unsigned long long pages = 0;
+    int i;
+
+    for (i = 0; i < kgsl_num_pools; i++)
+        if (!kgsl_pools[i].allocation_allowed)
+            pages += kgsl_pool_size(&kgsl_pools[i]);
+
+    return scnprintf(buf, PAGE_SIZE, "%llu\n",
+        pages << PAGE_SHIFT);
+}
+
+static int kgsl_pool_stats_get(char *buf,
+        const struct kernel_param *kp)
+{
+    int i, len = 0;
+
+    len += scnprintf(buf + len, PAGE_SIZE - len,
+        "size_bytes entries cached_bytes reserved max_entries reclaimable\n");
+
+    for (i = 0; i < kgsl_num_pools; i++) {
+        struct kgsl_page_pool *pool = &kgsl_pools[i];
+        unsigned int count = kgsl_pool_page_count(pool);
+        unsigned long long size =
+            (unsigned long long)PAGE_SIZE << pool->pool_order;
+
+        len += scnprintf(buf + len, PAGE_SIZE - len,
+            "%llu %u %llu %u %u %u\n",
+            size, count, size * count,
+            pool->reserved_pages, pool->max_pages,
+            pool->allocation_allowed);
+    }
+
+    return len;
+}
+
+static int kgsl_pool_hits_get(char *buf,
+        const struct kernel_param *kp)
+{
+    return scnprintf(buf, PAGE_SIZE, "%lld\n",
+        (long long)atomic64_read(&kgsl_pool_hits));
+}
+
+static int kgsl_pool_misses_get(char *buf,
+        const struct kernel_param *kp)
+{
+    return scnprintf(buf, PAGE_SIZE, "%lld\n",
+        (long long)atomic64_read(&kgsl_pool_misses));
+}
+
+static int kgsl_pool_shrink_get(char *buf,
+        const struct kernel_param *kp)
+{
+    return scnprintf(buf, PAGE_SIZE, "%llu\n",
+        (unsigned long long)
+        atomic64_read(&kgsl_pool_shrink_pages) << PAGE_SHIFT);
+}
+
+#define KGSL_POOL_RO_PARAM(name, getter) \
+    static const struct kernel_param_ops name##_ops = { \
+        .get = getter, \
+    }; \
+    module_param_cb(name, &name##_ops, NULL, 0444)
+
+KGSL_POOL_RO_PARAM(pool_cached_bytes, kgsl_pool_cached_get);
+KGSL_POOL_RO_PARAM(pool_reclaimable_bytes, kgsl_pool_reclaimable_get);
+KGSL_POOL_RO_PARAM(pool_protected_bytes, kgsl_pool_protected_get);
+KGSL_POOL_RO_PARAM(pool_stats, kgsl_pool_stats_get);
+KGSL_POOL_RO_PARAM(pool_hits, kgsl_pool_hits_get);
+KGSL_POOL_RO_PARAM(pool_misses, kgsl_pool_misses_get);
+KGSL_POOL_RO_PARAM(pool_shrink_bytes, kgsl_pool_shrink_get);
 
 /*
  * This will shrink the specified pool by num_pages or its pool_size,
@@ -358,8 +460,12 @@ int kgsl_pool_alloc_page(int *page_size, struct page **pages,
 
 	pool_idx = kgsl_pool_idx_lookup(order);
 	page = _kgsl_pool_get_page(pool);
-	if (page)
+	if (page) {
+		atomic64_inc(&kgsl_pool_hits);
 		kgsl_pool_schedule_refill(pool);
+	} else {
+		atomic64_inc(&kgsl_pool_misses);
+	}
 
 	/* Allocate a new page if not allocated from pool */
 	if (page == NULL) {
@@ -539,6 +645,7 @@ kgsl_pool_shrink_scan_objects(struct shrinker *shrinker,
 		freed += _kgsl_pool_shrink(pool, nr);
 	}
 
+	atomic64_add(freed, &kgsl_pool_shrink_pages);
 	return freed ? freed : SHRINK_STOP;
 }
 
