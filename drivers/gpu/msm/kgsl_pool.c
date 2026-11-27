@@ -7,6 +7,8 @@
 #include <asm/cacheflush.h>
 #include <linux/atomic.h>
 #include <linux/highmem.h>
+#include <linux/mm.h>
+#include <linux/jiffies.h>
 #include <linux/llist.h>
 #include <linux/moduleparam.h>
 #include <linux/of.h>
@@ -50,12 +52,44 @@ struct kgsl_page_pool {
 
 static struct kgsl_page_pool kgsl_pools[KGSL_MAX_POOLS];
 static int kgsl_num_pools;
-static int kgsl_pool_max_pages;
+static unsigned int kgsl_pool_max_pages;
+
+/*
+ * Serialize pool admission and removal across all page orders.
+ * Aggregate accounting uses base pages, not compound entries.
+ */
+static DEFINE_SPINLOCK(kgsl_pool_account_lock);
+static unsigned long kgsl_pool_cached_pages;
 
 /* Singularity AGMM: GPU pool observability */
 static atomic64_t kgsl_pool_hits = ATOMIC64_INIT(0);
 static atomic64_t kgsl_pool_misses = ATOMIC64_INIT(0);
 static atomic64_t kgsl_pool_shrink_pages = ATOMIC64_INIT(0);
+
+/* AGMM: foreground physical allocation diagnostics. */
+static atomic64_t kgsl_pool_alloc_attempts[KGSL_MAX_POOL_ORDER + 1];
+static atomic64_t kgsl_pool_alloc_successes[KGSL_MAX_POOL_ORDER + 1];
+static atomic64_t kgsl_pool_alloc_failures[KGSL_MAX_POOL_ORDER + 1];
+
+static struct page *kgsl_pool_alloc_system(gfp_t mask,
+                                         unsigned int order)
+{
+    struct page *page;
+
+    if (order > KGSL_MAX_POOL_ORDER)
+        return alloc_pages(mask, order);
+
+    atomic64_inc(&kgsl_pool_alloc_attempts[order]);
+
+    page = alloc_pages(mask, order);
+
+    if (page)
+        atomic64_inc(&kgsl_pool_alloc_successes[order]);
+    else
+        atomic64_inc(&kgsl_pool_alloc_failures[order]);
+
+    return page;
+}
 /*
  * Allow high-order pool misses to spill to system allocation before
  * immediately degrading to lower-order pages.
@@ -73,6 +107,47 @@ MODULE_PARM_DESC(pool_background_refill,
 		"Refill KGSL page pools in the background after allocation bursts");
 
 #define KGSL_POOL_REFILL_BATCH 16
+#define KGSL_POOL_RECLAIM_COOLDOWN_MS 500
+
+static unsigned long kgsl_pool_reclaim_until;
+static bool kgsl_pool_reclaim_cooldown;
+static atomic64_t kgsl_pool_refill_reclaim_skips =
+	ATOMIC64_INIT(0);
+
+static bool kgsl_pool_recent_reclaim(void)
+{
+	return READ_ONCE(kgsl_pool_reclaim_cooldown) &&
+		time_before(jiffies,
+			READ_ONCE(kgsl_pool_reclaim_until));
+}
+
+/*
+ * Singularity AGMM pressure-aware refill.
+ *
+ * Background caching is opportunistic. Never restrict demand
+ * allocations based on this policy.
+ */
+static atomic64_t kgsl_pool_refill_throttled = ATOMIC64_INIT(0);
+static atomic64_t kgsl_pool_refill_skipped = ATOMIC64_INIT(0);
+
+static unsigned int kgsl_pool_adaptive_batch(void)
+{
+	long available = si_mem_available();
+	unsigned long total = totalram_pages;
+	unsigned long floor = SZ_256M >> PAGE_SHIFT;
+
+	if (available <= 0)
+		return 0;
+
+	if ((unsigned long)available < max(floor, total / 10))
+		return 0;
+
+	if ((unsigned long)available < total / 5)
+		return 4;
+
+	return KGSL_POOL_REFILL_BATCH;
+}
+
 
 static void kgsl_pool_refill_worker(struct work_struct *work);
 static DECLARE_WORK(kgsl_pool_refill_work, kgsl_pool_refill_worker);
@@ -92,10 +167,31 @@ _kgsl_get_pool_from_order(unsigned int order)
 	return NULL;
 }
 
+/*
+ * AGMM: caller must hold kgsl_pool_account_lock.
+ * All aggregate accounting is expressed in base pages.
+ */
+static bool kgsl_pool_can_cache(struct kgsl_page_pool *pool,
+                               unsigned long pages)
+{
+    if ((unsigned int)atomic_read(&pool->page_count) >=
+            pool->max_pages)
+        return false;
+
+    if (kgsl_pool_max_pages &&
+        (kgsl_pool_cached_pages >= kgsl_pool_max_pages ||
+         pages > kgsl_pool_max_pages - kgsl_pool_cached_pages))
+        return false;
+
+    return true;
+}
+
 /* Add a page to specified pool */
 static void
 _kgsl_pool_add_page(struct kgsl_page_pool *pool, struct page *p)
 {
+	unsigned long pages = 1UL << pool->pool_order;
+
 	/*
 	 * Sanity check to make sure we don't re-pool a page that
 	 * somebody else has a reference to.
@@ -105,13 +201,42 @@ _kgsl_pool_add_page(struct kgsl_page_pool *pool, struct page *p)
 		return;
 	}
 
+	/*
+	 * Avoid expensive zeroing and cache maintenance when
+	 * the page cannot currently be admitted.
+	 */
+	spin_lock(&kgsl_pool_account_lock);
+	if (!kgsl_pool_can_cache(pool, pages)) {
+		spin_unlock(&kgsl_pool_account_lock);
+		__free_pages(p, pool->pool_order);
+		return;
+	}
+	spin_unlock(&kgsl_pool_account_lock);
+
+	/*
+	 * Keep zeroing outside the lock. Every cached page
+	 * must be sanitized before publication.
+	 */
 	kgsl_zero_page(p, pool->pool_order);
 
-	/* Account for the page before publishing it to concurrent consumers. */
+	spin_lock(&kgsl_pool_account_lock);
+
+	/* Capacity may have changed while zeroing. */
+	if (!kgsl_pool_can_cache(pool, pages)) {
+		spin_unlock(&kgsl_pool_account_lock);
+		__free_pages(p, pool->pool_order);
+		return;
+	}
+
 	atomic_inc(&pool->page_count);
+	kgsl_pool_cached_pages += pages;
+
 	mod_node_page_state(page_pgdat(p), NR_KERNEL_MISC_RECLAIMABLE,
-			    (1 << pool->pool_order));
+			    pages);
+
 	llist_add((struct llist_node *)&p->lru, &pool->page_list);
+
+	spin_unlock(&kgsl_pool_account_lock);
 }
 
 /* Returns a page from specified pool */
@@ -121,17 +246,19 @@ _kgsl_pool_get_page(struct kgsl_page_pool *pool)
 	struct llist_node *node;
 	struct page *p = NULL;
 
-	spin_lock(&pool->list_lock);
+	spin_lock(&kgsl_pool_account_lock);
 	node = llist_del_first(&pool->page_list);
-	spin_unlock(&pool->list_lock);
 
 	if (node) {
 		atomic_dec(&pool->page_count);
+		kgsl_pool_cached_pages -= 1UL << pool->pool_order;
 		p = container_of((struct list_head *)node, struct page, lru);
 		mod_node_page_state(page_pgdat(p),
 				    NR_KERNEL_MISC_RECLAIMABLE,
 				    -(1 << pool->pool_order));
 	}
+
+	spin_unlock(&kgsl_pool_account_lock);
 
 	return p;
 }
@@ -153,6 +280,11 @@ static void kgsl_pool_schedule_refill(struct kgsl_page_pool *pool)
 {
 	if (!kgsl_pool_background_refill || !pool || !pool->reserved_pages)
 		return;
+
+	if (kgsl_pool_recent_reclaim()) {
+		atomic64_inc(&kgsl_pool_refill_reclaim_skips);
+		return;
+	}
 
 	if (kgsl_pool_page_count(pool) * 2 <= pool->reserved_pages)
 		schedule_work(&kgsl_pool_refill_work);
@@ -185,8 +317,7 @@ static int kgsl_pool_reclaimable_get(char *buf,
     int i;
 
     for (i = 0; i < kgsl_num_pools; i++)
-        if (kgsl_pools[i].allocation_allowed)
-            pages += kgsl_pool_size(&kgsl_pools[i]);
+        pages += kgsl_pool_size(&kgsl_pools[i]);
 
     return scnprintf(buf, PAGE_SIZE, "%llu\n",
         pages << PAGE_SHIFT);
@@ -195,15 +326,8 @@ static int kgsl_pool_reclaimable_get(char *buf,
 static int kgsl_pool_protected_get(char *buf,
         const struct kernel_param *kp)
 {
-    unsigned long long pages = 0;
-    int i;
-
-    for (i = 0; i < kgsl_num_pools; i++)
-        if (!kgsl_pools[i].allocation_allowed)
-            pages += kgsl_pool_size(&kgsl_pools[i]);
-
-    return scnprintf(buf, PAGE_SIZE, "%llu\n",
-        pages << PAGE_SHIFT);
+    /* All idle pool pages are now shrinker eligible. */
+    return scnprintf(buf, PAGE_SIZE, "0\n");
 }
 
 static int kgsl_pool_stats_get(char *buf,
@@ -212,7 +336,7 @@ static int kgsl_pool_stats_get(char *buf,
     int i, len = 0;
 
     len += scnprintf(buf + len, PAGE_SIZE - len,
-        "size_bytes entries cached_bytes reserved max_entries reclaimable\n");
+        "size_bytes entries cached_bytes reserved max_entries reclaimable allocation_allowed\n");
 
     for (i = 0; i < kgsl_num_pools; i++) {
         struct kgsl_page_pool *pool = &kgsl_pools[i];
@@ -221,10 +345,10 @@ static int kgsl_pool_stats_get(char *buf,
             (unsigned long long)PAGE_SIZE << pool->pool_order;
 
         len += scnprintf(buf + len, PAGE_SIZE - len,
-            "%llu %u %llu %u %u %u\n",
+            "%llu %u %llu %u %u %u %u\n",
             size, count, size * count,
             pool->reserved_pages, pool->max_pages,
-            pool->allocation_allowed);
+            1U, (unsigned int)pool->allocation_allowed);
     }
 
     return len;
@@ -257,6 +381,90 @@ static int kgsl_pool_shrink_get(char *buf,
         .get = getter, \
     }; \
     module_param_cb(name, &name##_ops, NULL, 0444)
+
+static int kgsl_pool_limit_get(char *buf,
+        const struct kernel_param *kp)
+{
+    return scnprintf(buf, PAGE_SIZE, "%llu\n",
+        (unsigned long long)kgsl_pool_max_pages << PAGE_SHIFT);
+}
+
+KGSL_POOL_RO_PARAM(pool_cache_limit_bytes, kgsl_pool_limit_get);
+
+static int kgsl_pool_refill_throttled_get(char *buf,
+		const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE, "%lld\n",
+		(long long)atomic64_read(&kgsl_pool_refill_throttled));
+}
+
+static int kgsl_pool_refill_skipped_get(char *buf,
+		const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE, "%lld\n",
+		(long long)atomic64_read(&kgsl_pool_refill_skipped));
+}
+
+static int kgsl_pool_refill_batch_get(char *buf,
+		const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE, "%u\n",
+		kgsl_pool_adaptive_batch());
+}
+
+KGSL_POOL_RO_PARAM(pool_refill_throttled,
+		kgsl_pool_refill_throttled_get);
+KGSL_POOL_RO_PARAM(pool_refill_skipped,
+		kgsl_pool_refill_skipped_get);
+KGSL_POOL_RO_PARAM(pool_refill_batch,
+		kgsl_pool_refill_batch_get);
+
+static int kgsl_pool_refill_reclaim_skips_get(char *buf,
+		const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE, "%lld\n",
+		(long long)atomic64_read(
+			&kgsl_pool_refill_reclaim_skips));
+}
+
+static int kgsl_pool_reclaim_active_get(char *buf,
+		const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE, "%u\n",
+		(unsigned int)kgsl_pool_recent_reclaim());
+}
+
+KGSL_POOL_RO_PARAM(pool_refill_reclaim_skips,
+		kgsl_pool_refill_reclaim_skips_get);
+
+KGSL_POOL_RO_PARAM(pool_reclaim_active,
+		kgsl_pool_reclaim_active_get);
+
+static int kgsl_pool_order_stats_get(char *buf,
+        const struct kernel_param *kp)
+{
+    int order, len = 0;
+
+    len += scnprintf(buf + len, PAGE_SIZE - len,
+        "order size_bytes attempts successes failures\n");
+
+    for (order = 0; order <= KGSL_MAX_POOL_ORDER; order++) {
+        len += scnprintf(buf + len, PAGE_SIZE - len,
+            "%d %lu %lld %lld %lld\n",
+            order, PAGE_SIZE << order,
+            (long long)atomic64_read(
+                &kgsl_pool_alloc_attempts[order]),
+            (long long)atomic64_read(
+                &kgsl_pool_alloc_successes[order]),
+            (long long)atomic64_read(
+                &kgsl_pool_alloc_failures[order]));
+    }
+
+    return len;
+}
+
+KGSL_POOL_RO_PARAM(pool_order_stats,
+        kgsl_pool_order_stats_get);
 
 KGSL_POOL_RO_PARAM(pool_cached_bytes, kgsl_pool_cached_get);
 KGSL_POOL_RO_PARAM(pool_reclaimable_bytes, kgsl_pool_reclaimable_get);
@@ -423,7 +631,7 @@ int kgsl_pool_alloc_page(int *page_size, struct page **pages,
 	if (!kgsl_num_pools) {
 		gfp_t gfp_mask = kgsl_gfp_mask(order);
 
-		page = alloc_pages(gfp_mask, order);
+		page = kgsl_pool_alloc_system(gfp_mask, order);
 		if (page == NULL) {
 			/* Retry with lower order pages */
 			if (order > 0) {
@@ -450,7 +658,7 @@ int kgsl_pool_alloc_page(int *page_size, struct page **pages,
 			 */
 			gfp_t gfp_mask = kgsl_gfp_mask(order);
 
-			page = alloc_pages(gfp_mask, order);
+			page = kgsl_pool_alloc_system(gfp_mask, order);
 			if (page == NULL)
 				return -ENOMEM;
 			kgsl_zero_page(page, order);
@@ -481,7 +689,7 @@ int kgsl_pool_alloc_page(int *page_size, struct page **pages,
 			 * back to the legacy lower-order retry behavior.
 			 */
 			if (kgsl_pool_sysmem_fallback) {
-				page = alloc_pages(gfp_mask, order);
+				page = kgsl_pool_alloc_system(gfp_mask, order);
 				tried_sysmem_fallback = true;
 				if (page)
 					kgsl_zero_page(page, order);
@@ -495,7 +703,7 @@ int kgsl_pool_alloc_page(int *page_size, struct page **pages,
 		}
 
 		if (!page)
-			page = alloc_pages(gfp_mask, order);
+			page = kgsl_pool_alloc_system(gfp_mask, order);
 
 		if (!page) {
 			if (pool_idx > 0) {
@@ -542,13 +750,10 @@ void kgsl_pool_free_page(struct page *page)
 	mod_node_page_state(page_pgdat(page), NR_UNRECLAIMABLE_PAGES,
 					-(1 << page_order));
 
-	if (!kgsl_pool_max_pages ||
-			(kgsl_pool_size_total() < kgsl_pool_max_pages)) {
-		pool = _kgsl_get_pool_from_order(page_order);
-		if (pool && (atomic_read(&pool->page_count) < pool->max_pages)) {
-			_kgsl_pool_add_page(pool, page);
-			return;
-		}
+	pool = _kgsl_get_pool_from_order(page_order);
+	if (pool) {
+		_kgsl_pool_add_page(pool, page);
+		return;
 	}
 
 	/* Give back to system as not added to pool */
@@ -596,7 +801,28 @@ static void kgsl_pool_reserve_pages(void)
 
 static void kgsl_pool_refill_worker(struct work_struct *work)
 {
+	unsigned int adaptive_batch;
+
 	int i;
+
+
+	if (!READ_ONCE(kgsl_pool_background_refill))
+		return;
+
+	if (kgsl_pool_recent_reclaim()) {
+		atomic64_inc(&kgsl_pool_refill_reclaim_skips);
+		return;
+	}
+
+	adaptive_batch = kgsl_pool_adaptive_batch();
+
+	if (!adaptive_batch) {
+		atomic64_inc(&kgsl_pool_refill_skipped);
+		return;
+	}
+
+	if (adaptive_batch < KGSL_POOL_REFILL_BATCH)
+		atomic64_inc(&kgsl_pool_refill_throttled);
 
 	for (i = 0; i < kgsl_num_pools; i++) {
 		struct kgsl_page_pool *pool = &kgsl_pools[i];
@@ -608,11 +834,40 @@ static void kgsl_pool_refill_worker(struct work_struct *work)
 		if (refill <= 0)
 			continue;
 
-		refill = min_t(int, refill, KGSL_POOL_REFILL_BATCH);
+		adaptive_batch = kgsl_pool_adaptive_batch();
+		if (!adaptive_batch) {
+			atomic64_inc(&kgsl_pool_refill_skipped);
+			return;
+		}
+
+		refill = min_t(int, refill, adaptive_batch);
+
 		for (j = 0; j < refill; j++) {
 			gfp_t gfp_mask = kgsl_gfp_mask(pool->pool_order);
-			struct page *page = alloc_pages(gfp_mask, pool->pool_order);
+			struct page *page;
+			bool can_cache;
 
+			if (kgsl_pool_recent_reclaim()) {
+				atomic64_inc(&kgsl_pool_refill_reclaim_skips);
+				return;
+			}
+
+			spin_lock(&kgsl_pool_account_lock);
+			can_cache = kgsl_pool_can_cache(pool,
+					1UL << pool->pool_order);
+			spin_unlock(&kgsl_pool_account_lock);
+
+			if (!can_cache)
+				break;
+
+			/*
+			 * Background refill is opportunistic.
+			 * Never initiate reclaim just to populate a cache.
+			 */
+			gfp_mask &= ~__GFP_RECLAIM;
+			gfp_mask |= __GFP_NOWARN | __GFP_NORETRY;
+
+			page = alloc_pages(gfp_mask, pool->pool_order);
 			if (!page)
 				break;
 
@@ -635,9 +890,10 @@ kgsl_pool_shrink_scan_objects(struct shrinker *shrinker,
 		struct kgsl_page_pool *pool = &kgsl_pools[i];
 		unsigned long nr;
 
-		if (!pool->allocation_allowed)
-			continue;
-
+		/*
+		 * AGMM: reserved-only pools contain idle cached pages.
+		 * They must remain reclaimable under system pressure.
+		 */
 		nr = min_t(unsigned long, sc->nr_to_scan - freed,
 			   kgsl_pool_size(pool));
 		/* Free whole compound pages. */
@@ -645,8 +901,30 @@ kgsl_pool_shrink_scan_objects(struct shrinker *shrinker,
 		freed += _kgsl_pool_shrink(pool, nr);
 	}
 
+	/*
+	 * Concurrent allocations may empty the pools after
+	 * count_objects(). Stop rather than report zero progress.
+	 */
+	if (!freed) {
+		sc->nr_scanned = 0;
+		return SHRINK_STOP;
+	}
+
+	/*
+	 * Compound-page rounding can free more base pages than
+	 * requested. Never over-consume the VM scan budget.
+	 */
+	sc->nr_scanned = min(freed, sc->nr_to_scan);
+
+	spin_lock(&kgsl_pool_account_lock);
+	WRITE_ONCE(kgsl_pool_reclaim_until,
+		jiffies + msecs_to_jiffies(
+			KGSL_POOL_RECLAIM_COOLDOWN_MS));
+	WRITE_ONCE(kgsl_pool_reclaim_cooldown, true);
+	spin_unlock(&kgsl_pool_account_lock);
+
 	atomic64_add(freed, &kgsl_pool_shrink_pages);
-	return freed ? freed : SHRINK_STOP;
+	return freed;
 }
 
 static unsigned long
@@ -659,10 +937,8 @@ kgsl_pool_shrink_count_objects(struct shrinker *shrinker,
 	/* Trigger mem_workqueue flush to free memory */
 	kgsl_schedule_work(&kgsl_driver.mem_work);
 
-	for (i = 0; i < kgsl_num_pools; i++) {
-		if (kgsl_pools[i].allocation_allowed)
-			count += kgsl_pool_size(&kgsl_pools[i]);
-	}
+	for (i = 0; i < kgsl_num_pools; i++)
+		count += kgsl_pool_size(&kgsl_pools[i]);
 
 	return count ? count : SHRINK_EMPTY;
 }
@@ -684,8 +960,12 @@ static void kgsl_pool_config(unsigned int order, unsigned int reserved_pages,
 		return;
 	}
 #endif
-	if ((order > KGSL_MAX_POOL_ORDER) ||
-			(reserved_pages > KGSL_MAX_RESERVED_PAGES))
+	if (order > KGSL_MAX_POOL_ORDER ||
+	    kgsl_num_pools >= KGSL_MAX_POOLS)
+		return;
+
+	/* DT reservations count compound entries, not base pages. */
+	if (reserved_pages > (KGSL_MAX_RESERVED_PAGES >> order))
 		return;
 
 	kgsl_pools[kgsl_num_pools].pool_order = order;
@@ -761,6 +1041,63 @@ static void kgsl_of_get_mempools(struct device_node *parent)
 	}
 }
 
+/*
+ * Singularity AGMM: RAM-aware GPU cache policy.
+ *
+ * Limit idle cached pages without restricting active GPU allocations.
+ * Use managed RAM thresholds to account for firmware reservations.
+ * Preserve stricter platform limits supplied by the device tree.
+ */
+static void kgsl_pool_apply_ram_policy(void)
+{
+	unsigned int cache_mib;
+	unsigned int large_mib;
+	unsigned int cache_pages;
+	unsigned long ram_mib;
+	int i;
+
+	ram_mib = ((unsigned long)totalram_pages << PAGE_SHIFT) >> 20;
+
+	if (ram_mib >= 10240) {
+		cache_mib = 384;
+		large_mib = 96;
+	} else if (ram_mib >= 6656) {
+		cache_mib = 256;
+		large_mib = 64;
+	} else if (ram_mib >= 4096) {
+		cache_mib = 192;
+		large_mib = 48;
+	} else {
+		cache_mib = 64;
+		large_mib = 16;
+	}
+
+	cache_pages = (cache_mib * SZ_1M) >> PAGE_SHIFT;
+
+	if (!kgsl_pool_max_pages)
+		kgsl_pool_max_pages = cache_pages;
+	else
+		kgsl_pool_max_pages = min(kgsl_pool_max_pages,
+					  cache_pages);
+
+	for (i = 0; i < kgsl_num_pools; i++) {
+		struct kgsl_page_pool *pool = &kgsl_pools[i];
+		unsigned long entry_size = PAGE_SIZE << pool->pool_order;
+		unsigned int limit;
+
+		if (entry_size < SZ_1M)
+			continue;
+
+		limit = (large_mib * SZ_1M) / entry_size;
+		pool->max_pages = min(pool->max_pages, limit);
+	}
+
+	pr_info("kgsl: AGMM RAM=%lu MiB cache_limit=%lu MiB large_pool_limit=%u MiB\n",
+		ram_mib,
+		((unsigned long)kgsl_pool_max_pages << PAGE_SHIFT) >> 20,
+		large_mib);
+}
+
 void kgsl_init_page_pools(struct kgsl_device *device)
 {
 	if (device->flags & KGSL_FLAG_USE_SHMEM)
@@ -768,6 +1105,9 @@ void kgsl_init_page_pools(struct kgsl_device *device)
 
 	/* Get GPU mempools data and configure pools */
 	kgsl_of_get_mempools(device->pdev->dev.of_node);
+
+	/* Establish cache limits before admitting reserved pages. */
+	kgsl_pool_apply_ram_policy();
 
 	/* Reserve the appropriate number of pages for each pool */
 	kgsl_pool_reserve_pages();
