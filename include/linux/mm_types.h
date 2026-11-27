@@ -6,6 +6,7 @@
 
 #include <linux/auxvec.h>
 #include <linux/list.h>
+#include <linux/nodemask.h>
 #include <linux/spinlock.h>
 #include <linux/rbtree.h>
 #include <linux/rwsem.h>
@@ -514,6 +515,15 @@ struct mm_struct {
 #if IS_ENABLED(CONFIG_HMM)
 		/* HMM needs to track a few things per mm */
 		struct hmm *hmm;
+#endif
+#ifdef CONFIG_LRU_GEN
+		struct {
+			struct list_head list;
+#ifdef CONFIG_MEMCG
+			struct mem_cgroup *memcg;
+#endif
+			nodemask_t nodes;
+		} lru_gen;
 #endif
 	} __randomize_layout;
 

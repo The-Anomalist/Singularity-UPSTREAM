@@ -4183,10 +4183,16 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 	if (flags & FAULT_FLAG_USER)
 		mem_cgroup_enter_user_fault();
 
+#ifdef CONFIG_LRU_GEN
+	current->in_lru_fault = !(vma->vm_flags & (VM_SEQ_READ | VM_RAND_READ));
+#endif
 	if (unlikely(is_vm_hugetlb_page(vma)))
 		ret = hugetlb_fault(vma->vm_mm, vma, address, flags);
 	else
 		ret = __handle_mm_fault(vma, address, flags);
+#ifdef CONFIG_LRU_GEN
+	current->in_lru_fault = false;
+#endif
 
 	if (flags & FAULT_FLAG_USER) {
 		mem_cgroup_exit_user_fault();

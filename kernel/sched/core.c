@@ -3672,8 +3672,12 @@ context_switch(struct rq *rq, struct task_struct *prev,
 		next->active_mm = oldmm;
 		mmgrab(oldmm);
 		enter_lazy_tlb(oldmm, next);
-	} else
+	} else {
 		switch_mm_irqs_off(oldmm, mm, next);
+#ifdef CONFIG_LRU_GEN
+		nodes_setall(mm->lru_gen.nodes);
+#endif
+	}
 
 	if (!prev->mm) {
 		prev->active_mm = NULL;

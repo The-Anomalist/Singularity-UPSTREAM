@@ -1048,6 +1048,10 @@ static int exec_mmap(struct mm_struct *mm)
 		local_irq_enable();
 	tsk->mm->vmacache_seqnum = 0;
 	vmacache_flush(tsk);
+#ifdef CONFIG_LRU_GEN
+	lru_gen_add_mm(mm);
+	nodes_setall(mm->lru_gen.nodes);
+#endif
 	task_unlock(tsk);
 	if (old_mm) {
 		mmap_read_unlock(old_mm);

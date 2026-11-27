@@ -1020,6 +1020,13 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	spin_lock_init(&mm->page_table_lock);
 	spin_lock_init(&mm->arg_lock);
 	mm_init_cpumask(mm);
+#ifdef CONFIG_LRU_GEN
+	INIT_LIST_HEAD(&mm->lru_gen.list);
+	nodes_clear(mm->lru_gen.nodes);
+#ifdef CONFIG_MEMCG
+	mm->lru_gen.memcg = NULL;
+#endif
+#endif
 	mm_init_aio(mm);
 	mm_init_owner(mm, p);
 	RCU_INIT_POINTER(mm->exe_file, NULL);
@@ -1074,6 +1081,10 @@ struct mm_struct *mm_alloc(void)
 static inline void __mmput(struct mm_struct *mm)
 {
 	VM_BUG_ON(atomic_read(&mm->mm_users));
+
+#ifdef CONFIG_LRU_GEN
+	lru_gen_del_mm(mm);
+#endif
 
 	uprobe_clear_state(mm);
 	exit_aio(mm);
@@ -2268,6 +2279,19 @@ static __latent_entropy struct task_struct *copy_process(
 	proc_fork_connector(p);
 	cgroup_post_fork(p);
 	cgroup_threadgroup_change_end(current);
+
+#ifdef CONFIG_LRU_GEN
+	/*
+	 * cgroup_post_fork() establishes the child's final css_set. Serialize
+	 * against a concurrent memcg attach before registering a new MM.
+	 */
+	if (!(clone_flags & CLONE_VM)) {
+		task_lock(p);
+		lru_gen_add_mm(p->mm);
+		task_unlock(p);
+	}
+#endif
+
 	perf_event_fork(p);
 
 	trace_task_newtask(p, clone_flags);

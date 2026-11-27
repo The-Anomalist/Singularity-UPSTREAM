@@ -1172,7 +1172,7 @@ void mem_cgroup_update_lru_size(struct lruvec *lruvec, enum lru_list lru,
 				int zid, int nr_pages)
 {
 	struct mem_cgroup_per_node *mz;
-	unsigned long *lru_size;
+	long *lru_size;
 	long size;
 
 	if (mem_cgroup_disabled())
@@ -1180,6 +1180,24 @@ void mem_cgroup_update_lru_size(struct lruvec *lruvec, enum lru_list lru,
 
 	mz = container_of(lruvec, struct mem_cgroup_per_node, lruvec);
 	lru_size = &mz->lru_zone_size[zid][lru];
+
+#ifdef CONFIG_LRU_GEN
+	/*
+	 * Generation promotion can precede its batched accounting.
+	 * Preserve the signed balance until pending deltas arrive.
+	 * Legacy LRU retains its original consistency checks.
+	 */
+	/*
+	 * Generation accounting can be deferred across runtime
+	 * state transitions. Preserve signed balances until
+	 * outstanding updates have been applied.
+	 */
+	if (lru != LRU_UNEVICTABLE) {
+		WRITE_ONCE(*lru_size, *lru_size + nr_pages);
+		return;
+	}
+#endif
+
 
 	if (nr_pages < 0)
 		*lru_size += nr_pages;
@@ -4522,6 +4540,9 @@ static void __mem_cgroup_free(struct mem_cgroup *memcg)
 
 static void mem_cgroup_free(struct mem_cgroup *memcg)
 {
+#ifdef CONFIG_LRU_GEN
+	lru_gen_exit_memcg(memcg);
+#endif
 	memcg_wb_domain_exit(memcg);
 	__mem_cgroup_free(memcg);
 }
@@ -4561,6 +4582,9 @@ static struct mem_cgroup *mem_cgroup_alloc(void)
 	INIT_LIST_HEAD(&memcg->oom_notify);
 	mutex_init(&memcg->thresholds_lock);
 	spin_lock_init(&memcg->move_lock);
+#ifdef CONFIG_LRU_GEN
+	lru_gen_init_memcg(memcg);
+#endif
 	vmpressure_init(&memcg->vmpressure);
 	INIT_LIST_HEAD(&memcg->event_list);
 	spin_lock_init(&memcg->event_list_lock);
@@ -5210,6 +5234,7 @@ static void mem_cgroup_clear_mc(void)
 	mmput(mm);
 }
 
+
 static int mem_cgroup_can_attach(struct cgroup_taskset *tset)
 {
 	struct cgroup_subsys_state *css;
@@ -5219,6 +5244,7 @@ static int mem_cgroup_can_attach(struct cgroup_taskset *tset)
 	struct mm_struct *mm;
 	unsigned long move_flags;
 	int ret = 0;
+
 
 	/* charge immigration isn't supported on the default hierarchy */
 	if (cgroup_subsys_on_dfl(memory_cgrp_subsys))
@@ -5454,6 +5480,21 @@ static void mem_cgroup_cancel_attach(struct cgroup_taskset *tset)
 }
 static void mem_cgroup_move_task(void)
 {
+}
+#endif
+
+#ifdef CONFIG_LRU_GEN
+static void mem_cgroup_attach(struct cgroup_taskset *tset)
+{
+	struct task_struct *task;
+	struct cgroup_subsys_state *css;
+
+	cgroup_taskset_for_each_leader(task, css, tset) {
+		task_lock(task);
+		if (task->mm && READ_ONCE(task->mm->owner) == task)
+			lru_gen_migrate_mm(task->mm);
+		task_unlock(task);
+	}
 }
 #endif
 
@@ -5827,6 +5868,9 @@ struct cgroup_subsys memory_cgrp_subsys = {
 	.css_reset = mem_cgroup_css_reset,
 	.can_attach = mem_cgroup_can_attach,
 	.cancel_attach = mem_cgroup_cancel_attach,
+#ifdef CONFIG_LRU_GEN
+	.attach = mem_cgroup_attach,
+#endif
 	.post_attach = mem_cgroup_move_task,
 	.bind = mem_cgroup_bind,
 	.dfl_cftypes = memory_files,

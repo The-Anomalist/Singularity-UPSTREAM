@@ -107,5 +107,17 @@
 #define LAST_CPUPID_NOT_IN_PAGE_FLAGS
 #endif
 
+/* Generation and reference fields are page metadata, not PG_* bits. */
+#define LRU_GEN_PGOFF	(BITS_PER_LONG - SECTIONS_WIDTH - NODES_WIDTH - \
+			 ZONES_WIDTH - LAST_CPUPID_WIDTH - KASAN_TAG_WIDTH - LRU_GEN_WIDTH)
+#define LRU_REFS_PGOFF	(LRU_GEN_PGOFF - LRU_REFS_WIDTH)
+#define LRU_GEN_MASK	((BIT(LRU_GEN_WIDTH) - 1) << LRU_GEN_PGOFF)
+#define LRU_REFS_MASK	((BIT(LRU_REFS_WIDTH) - 1) << LRU_REFS_PGOFF)
+
+/* Reference tiers use only bits left after all fixed page metadata. */
+#define LRU_REFS_WIDTH	min(__LRU_REFS_WIDTH, BITS_PER_LONG - NR_PAGEFLAGS - \
+			    SECTIONS_WIDTH - NODES_WIDTH - ZONES_WIDTH - \
+			    LAST_CPUPID_WIDTH - KASAN_TAG_WIDTH - LRU_GEN_WIDTH)
+
 #endif
 #endif /* _LINUX_PAGE_FLAGS_LAYOUT */

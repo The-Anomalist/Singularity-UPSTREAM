@@ -1238,6 +1238,9 @@ struct task_struct {
 
 	/* VM state: */
 	struct reclaim_state		*reclaim_state;
+#ifdef CONFIG_LRU_GEN
+	bool			in_lru_fault;
+#endif
 
 	struct backing_dev_info		*backing_dev_info;
 
