@@ -125,22 +125,21 @@
 	qcom,icc-min-peak-kbps = <16875000>;
 };
 
-/* Optimized Adreno 650 for high-performance workloads */
 &msm_gpu {
-	qcom,pm-qos-active-latency = <16>; /* Aggressive wake boost - down from 44/20 */
-	qcom,ca-busy-penalty = <8000>; /* Increased urgency (was 9000/10000) */
-	qcom,ca-target-pwrlevel = <0>; /* Target highest power level when busy */
-	qcom,tz-sample-floor = <4000>; /* Raise floor to reduce sampling overhead */
-	qcom,tz-min-busy = <650>; /* Higher minimum busy threshold (was 550) */
-	qcom,tz-busy-ceiling = <32000>; /* Full ceiling utilization (was 28000) */
+	qcom,pm-qos-active-latency = <20>;
+	qcom,ca-busy-penalty = <10000>;
+	qcom,ca-target-pwrlevel = <1>;
+	qcom,tz-sample-floor = <2500>;
+	qcom,tz-min-busy = <550>;
+	qcom,tz-busy-ceiling = <28000>;
 	qcom,gpu-icc-bw-avg-kbps =
-		<1 4921875 7812500 10625000 13437500 17343750 21093750
-		 27343750 37500000 43593750 50625000 60937500 71250000 81562500>;
+		<1 390625 585937 878906 1113281 1406250 1757812
+		 2109375 2812500 3375000 4218750 4921875 5625000 6328125>;
 	qcom,gpu-icc-bw-peak-kbps =
-		<1 19687500 30859375 42031250 52203125 65312500 78437500
-		 101250000 140625000 168750000 206250000 243750000 281250000 329062500>;
-	qcom,gpu-cfg-icc-bw-avg-kbps = <1 128>; /* Increased from 25/64 */
-	qcom,gpu-cfg-icc-bw-peak-kbps = <1 512>; /* Increased from 100/256 */
+		<1 1562500 2343750 3515625 4453125 5625000 7031250
+		 8437500 11250000 13500000 16875000 19687500 22500000 25312500>;
+	qcom,gpu-cfg-icc-bw-avg-kbps = <1 64>;
+	qcom,gpu-cfg-icc-bw-peak-kbps = <1 256>;
 };
 
 /*

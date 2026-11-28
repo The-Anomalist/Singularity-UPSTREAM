@@ -891,7 +891,7 @@ static bool npu_clk_need_reset(const char *clk_name)
 
 static int npu_enable_clocks(struct npu_device *npu_dev, bool post_pil)
 {
-	int i, rc = 0;
+	int i, rc = 0, cleanup_rc;
 	struct npu_clk *core_clks = npu_dev->core_clks;
 	struct npu_pwrctrl *pwr = &npu_dev->pwrctrl;
 	struct npu_pwrlevel *pwrlevel;
@@ -918,15 +918,26 @@ static int npu_enable_clocks(struct npu_device *npu_dev, bool post_pil)
 
 		if (core_clks[i].reset) {
 			rc = reset_control_deassert(core_clks[i].reset);
-			if (rc)
-				NPU_WARN("deassert %s reset failed\n",
-					core_clks[i].clk_name);
+			if (rc) {
+				NPU_ERR("deassert %s reset failed: %d\n",
+					core_clks[i].clk_name, rc);
+				break;
+			}
 		}
 
 		rc = clk_prepare_enable(core_clks[i].clk);
 		if (rc) {
-			NPU_ERR("%s enable failed\n",
-				core_clks[i].clk_name);
+			NPU_ERR("%s enable failed: %d\n",
+				core_clks[i].clk_name, rc);
+
+			if (core_clks[i].reset) {
+				cleanup_rc = reset_control_assert(
+					core_clks[i].reset);
+				if (cleanup_rc)
+					NPU_WARN("restore %s reset failed: %d\n",
+						core_clks[i].clk_name,
+						cleanup_rc);
+			}
 			break;
 		}
 
@@ -956,10 +967,12 @@ static int npu_enable_clocks(struct npu_device *npu_dev, bool post_pil)
 			clk_disable_unprepare(core_clks[i].clk);
 
 			if (core_clks[i].reset) {
-				rc = reset_control_assert(core_clks[i].reset);
-				if (rc)
-					NPU_WARN("assert %s reset failed\n",
-						core_clks[i].clk_name);
+				cleanup_rc = reset_control_assert(
+					core_clks[i].reset);
+				if (cleanup_rc)
+					NPU_WARN("assert %s reset failed: %d\n",
+						core_clks[i].clk_name,
+						cleanup_rc);
 			}
 		}
 	}
@@ -1089,11 +1102,19 @@ static void npu_disable_regulators(struct npu_device *npu_dev)
 	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
 	struct npu_regulator *regulators = npu_dev->regulators;
 
-	if (host_ctx->power_vote_num > 0) {
-		for (i = 0; i < npu_dev->regulator_num; i++)
-			regulator_disable(regulators[i].regulator);
+	if (!host_ctx->power_vote_num)
+		return;
 
-		host_ctx->power_vote_num--;
+	if (--host_ctx->power_vote_num)
+		return;
+
+	for (i = npu_dev->regulator_num - 1; i >= 0; i--) {
+		int rc;
+
+		rc = regulator_disable(regulators[i].regulator);
+		if (rc)
+			NPU_ERR("%s disable failed: %d\n",
+				regulators[i].regulator_name, rc);
 	}
 }
 
@@ -1791,7 +1812,7 @@ static int npu_parse_dt_bw(struct npu_device *npu_dev)
 
 	if (of_find_property(pdev->dev.of_node, "qcom,src-dst-ports", &len)) {
 		len /= sizeof(ports[0]);
-		if (len % 2 || len > ARRAY_SIZE(ports)) {
+		if (!len || len % 2 || len > ARRAY_SIZE(ports)) {
 			NPU_ERR("Unexpected number of ports %d\n", len);
 			return -EINVAL;
 		}
@@ -1817,8 +1838,9 @@ static int npu_parse_dt_bw(struct npu_device *npu_dev)
 
 	for (i = 0; i < ARRAY_SIZE(icc_names); i++) {
 		bwctrl->icc_paths[i] = devm_of_icc_get(&pdev->dev, icc_names[i]);
-		if (IS_ERR(bwctrl->icc_paths[i])) {
-			ret = PTR_ERR(bwctrl->icc_paths[i]);
+		if (IS_ERR_OR_NULL(bwctrl->icc_paths[i])) {
+			ret = bwctrl->icc_paths[i] ?
+				PTR_ERR(bwctrl->icc_paths[i]) : -ENODEV;
 			bwctrl->icc_paths[i] = NULL;
 			NPU_WARN("ICC unavailable for %s (%d), using msm_bus fallback\n",
 				 icc_names[i], ret);
@@ -1845,33 +1867,41 @@ static int npu_parse_dt_bw(struct npu_device *npu_dev)
 	bwctrl->bw_levels[1].num_paths = num_paths;
 	bwctrl->num_paths = num_paths;
 
-	bwctrl->bus_client = msm_bus_scale_register_client(&bwctrl->bw_data);
+	if (!bwctrl->num_icc_paths)
+		bwctrl->bus_client =
+			msm_bus_scale_register_client(&bwctrl->bw_data);
 	if (!bwctrl->bus_client && !bwctrl->num_icc_paths) {
 		NPU_ERR("Unable to register bus client or ICC paths\n");
-		return -ENODEV;
+		return -EPROBE_DEFER;
 	}
 
-	if (!bwctrl->bus_client)
-		NPU_WARN("msm_bus unavailable, using ICC only\n");
+	if (bwctrl->num_icc_paths)
+		NPU_INFO("NPU using ICC bandwidth backend\n");
+	else
+		NPU_INFO("NPU using legacy bandwidth backend\n");
 
 	NPU_INFO("NPU BW client sets up successfully\n");
 
 	return 0;
 }
 
-int npu_set_bw(struct npu_device *npu_dev, int new_ib, int new_ab)
+static int npu_set_bw_locked(struct npu_device *npu_dev,
+		int new_ib, int new_ab)
 {
-	int i, j, ret;
+	int i, j, ret, restore_ret;
 	u32 avg_bw = DIV_ROUND_UP_ULL((u64)new_ab * MBYTE, 1000);
 	u32 peak_bw = DIV_ROUND_UP_ULL((u64)new_ib * MBYTE, 1000);
 	struct npu_bwctrl *bwctrl = &npu_dev->bwctrl;
+	u32 old_avg = DIV_ROUND_UP_ULL(
+			(u64)bwctrl->cur_ab * MBYTE, 1000);
+	u32 old_peak = DIV_ROUND_UP_ULL(
+			(u64)bwctrl->cur_ib * MBYTE, 1000);
 
-	if (!bwctrl->bus_client && !bwctrl->num_icc_paths) {
-		NPU_DBG("no BW client exists\n");
-		return 0;
-	}
+	if (!bwctrl->bus_client && !bwctrl->num_icc_paths)
+		return -ENODEV;
 
-	if (bwctrl->cur_ib == new_ib && bwctrl->cur_ab == new_ab)
+	if (!bwctrl->state_unknown &&
+	    bwctrl->cur_ib == new_ib && bwctrl->cur_ab == new_ab)
 		return 0;
 
 	if (bwctrl->num_icc_paths) {
@@ -1879,13 +1909,15 @@ int npu_set_bw(struct npu_device *npu_dev, int new_ib, int new_ab)
 			if (!bwctrl->icc_paths[i])
 				continue;
 
-			ret = icc_set_bw(bwctrl->icc_paths[i], avg_bw, peak_bw);
+			ret = icc_set_bw(bwctrl->icc_paths[i],
+					avg_bw, peak_bw);
 			if (ret)
 				goto icc_fail;
 		}
 
 		bwctrl->cur_ib = new_ib;
 		bwctrl->cur_ab = new_ab;
+		bwctrl->state_unknown = false;
 		return 0;
 	}
 
@@ -1897,46 +1929,10 @@ int npu_set_bw(struct npu_device *npu_dev, int new_ib, int new_ab)
 			bwctrl->bw_levels[i].vectors[j].ib = 1;
 			bwctrl->bw_levels[i].vectors[j].ab = 1;
 		} else {
-			bwctrl->bw_levels[i].vectors[j].ib = new_ib * MBYTE;
+			bwctrl->bw_levels[i].vectors[j].ib =
+				(u64)new_ib * MBYTE;
 			bwctrl->bw_levels[i].vectors[j].ab =
-				new_ab * MBYTE / bwctrl->num_paths;
-		}
-	}
-
-	ret = 0;
-	if (bwctrl->bus_client)
-		ret = msm_bus_scale_client_update_request(bwctrl->bus_client, i);
-
-	if (!ret) {
-		bwctrl->cur_idx = i;
-		bwctrl->cur_ib = new_ib;
-		bwctrl->cur_ab = new_ab;
-	}
-
-	return ret;
-
-icc_fail:
-	NPU_WARN("ICC bandwidth request failed (%d), using msm_bus fallback\n", ret);
-
-	for (j = 0; j < i; j++) {
-		if (bwctrl->icc_paths[j])
-			icc_set_bw(bwctrl->icc_paths[j], 0, 0);
-	}
-
-	if (!bwctrl->bus_client)
-		return ret;
-
-	i = (bwctrl->cur_idx + 1) % DBL_BUF;
-
-	for (j = 0; j < bwctrl->num_paths; j++) {
-		if ((bwctrl->bw_levels[i].vectors[j].dst ==
-			MSM_BUS_SLAVE_CLK_CTL) && (new_ib > 0)) {
-			bwctrl->bw_levels[i].vectors[j].ib = 1;
-			bwctrl->bw_levels[i].vectors[j].ab = 1;
-		} else {
-			bwctrl->bw_levels[i].vectors[j].ib = new_ib * MBYTE;
-			bwctrl->bw_levels[i].vectors[j].ab =
-				new_ab * MBYTE / bwctrl->num_paths;
+				(u64)new_ab * MBYTE / bwctrl->num_paths;
 		}
 	}
 
@@ -1945,9 +1941,86 @@ icc_fail:
 		bwctrl->cur_idx = i;
 		bwctrl->cur_ib = new_ib;
 		bwctrl->cur_ab = new_ab;
+		bwctrl->state_unknown = false;
+	} else {
+		bwctrl->state_unknown = true;
 	}
 
 	return ret;
+
+icc_fail:
+	NPU_ERR("ICC bandwidth request failed: %d\n", ret);
+
+	/*
+	 * Restore the last committed request on every path,
+	 * including the path which reported the failure.
+	 */
+	bwctrl->state_unknown = false;
+
+	for (j = NPU_MAX_ICC_PATHS - 1; j >= 0; j--) {
+		if (!bwctrl->icc_paths[j])
+			continue;
+
+		restore_ret = icc_set_bw(bwctrl->icc_paths[j],
+					old_avg, old_peak);
+		if (restore_ret) {
+			bwctrl->state_unknown = true;
+			NPU_ERR("ICC path %d rollback failed: %d\n",
+				j, restore_ret);
+		}
+	}
+
+	return ret;
+}
+
+static int npu_set_owner_bw(struct npu_device *npu_dev,
+		int new_ib, int new_ab, bool ssr)
+{
+	struct npu_bwctrl *bwctrl = &npu_dev->bwctrl;
+	int effective_ib, effective_ab;
+	int ret;
+
+	if (new_ib < 0 || new_ab < 0)
+		return -EINVAL;
+
+	if (DIV_ROUND_UP_ULL((u64)new_ib * MBYTE, 1000) > U32_MAX ||
+	    DIV_ROUND_UP_ULL((u64)new_ab * MBYTE, 1000) > U32_MAX)
+		return -ERANGE;
+
+	mutex_lock(&bwctrl->lock);
+
+	if (ssr) {
+		effective_ib = max(bwctrl->core_ib, new_ib);
+		effective_ab = max(bwctrl->core_ab, new_ab);
+	} else {
+		effective_ib = max(bwctrl->ssr_ib, new_ib);
+		effective_ab = max(bwctrl->ssr_ab, new_ab);
+	}
+
+	ret = npu_set_bw_locked(npu_dev, effective_ib, effective_ab);
+	if (!ret) {
+		if (ssr) {
+			bwctrl->ssr_ib = new_ib;
+			bwctrl->ssr_ab = new_ab;
+		} else {
+			bwctrl->core_ib = new_ib;
+			bwctrl->core_ab = new_ab;
+		}
+	}
+
+	mutex_unlock(&bwctrl->lock);
+
+	return ret;
+}
+
+int npu_set_bw(struct npu_device *npu_dev, int new_ib, int new_ab)
+{
+	return npu_set_owner_bw(npu_dev, new_ib, new_ab, false);
+}
+
+int npu_set_ssr_bw(struct npu_device *npu_dev, int new_ib, int new_ab)
+{
+	return npu_set_owner_bw(npu_dev, new_ib, new_ab, true);
 }
 
 #define NPU_FMAX_THRESHOLD 1000000
@@ -2479,6 +2552,7 @@ static int npu_probe(struct platform_device *pdev)
 
 	npu_dev->pdev = pdev;
 	mutex_init(&npu_dev->dev_lock);
+	mutex_init(&npu_dev->bwctrl.lock);
 
 	dev_set_drvdata(&pdev->dev, npu_dev);
 	res = platform_get_resource_byname(pdev,
@@ -2603,8 +2677,10 @@ static int npu_probe(struct platform_device *pdev)
 		goto error_get_dev_num;
 
 	rc = npu_parse_dt_bw(npu_dev);
-	if (rc)
-		NPU_WARN("Parse bw info failed\n");
+	if (rc) {
+		NPU_WARN("Parse bw info failed: %d\n", rc);
+		goto error_get_dev_num;
+	}
 
 	rc = npu_hw_info_init(npu_dev);
 	if (rc)
@@ -2708,6 +2784,10 @@ error_class_create:
 	unregister_chrdev_region(npu_dev->dev_num, 1);
 	npu_mbox_deinit(npu_dev);
 error_get_dev_num:
+	if (npu_dev->bwctrl.bus_client) {
+		msm_bus_scale_unregister_client(npu_dev->bwctrl.bus_client);
+		npu_dev->bwctrl.bus_client = 0;
+	}
 	dev_set_drvdata(&pdev->dev, NULL);
 	return rc;
 }
@@ -2733,7 +2813,10 @@ static int npu_remove(struct platform_device *pdev)
 	for (i = 0; i < NPU_MAX_ICC_PATHS; i++)
 		if (npu_dev->bwctrl.icc_paths[i])
 			icc_set_bw(npu_dev->bwctrl.icc_paths[i], 0, 0);
-	msm_bus_scale_unregister_client(npu_dev->bwctrl.bus_client);
+	if (npu_dev->bwctrl.bus_client) {
+		msm_bus_scale_unregister_client(npu_dev->bwctrl.bus_client);
+		npu_dev->bwctrl.bus_client = 0;
+	}
 
 	g_npu_dev = NULL;
 

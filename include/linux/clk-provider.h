@@ -272,7 +272,7 @@ struct clk_ops {
 							struct clk_hw *hw);
 	long		(*list_rate)(struct clk_hw *hw, unsigned int n,
 							unsigned long rate_max);
-	void		(*bus_vote)(struct clk_hw *hw, bool enable);
+	int		(*bus_vote)(struct clk_hw *hw, bool enable);
 };
 
 /**
@@ -290,6 +290,8 @@ struct clk_ops {
  * @bus_cl_id: client id registered with the bus driver used for bw votes
  * @icc_path: interconnect path used for bandwidth votes
  */
+struct clk_debug_vote_state;
+
 struct clk_init_data {
 	const char		*name;
 	const struct clk_ops	*ops;
@@ -382,6 +384,7 @@ struct clk_hw {
 	struct clk_core *core;
 	struct clk *clk;
 	const struct clk_init_data *init;
+	struct clk_debug_vote_state *debug_vote;
 };
 
 /*
@@ -874,6 +877,9 @@ const char *clk_hw_get_name(const struct clk_hw *hw);
 struct clk_hw *__clk_get_hw(struct clk *clk);
 unsigned int clk_hw_get_num_parents(const struct clk_hw *hw);
 struct clk_hw *clk_hw_get_parent(const struct clk_hw *hw);
+void clk_hw_debug_transaction_begin(void);
+void clk_hw_debug_transaction_end(void);
+
 struct clk_hw *clk_hw_get_parent_by_index(const struct clk_hw *hw,
 					  unsigned int index);
 unsigned int __clk_get_enable_count(struct clk *clk);

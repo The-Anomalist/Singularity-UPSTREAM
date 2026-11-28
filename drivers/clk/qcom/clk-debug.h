@@ -4,7 +4,10 @@
 #ifndef __QCOM_CLK_DEBUG_H__
 #define __QCOM_CLK_DEBUG_H__
 
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
+#include <linux/of.h>
+#include <linux/clk-provider.h>
 #include "../clk.h"
 
 struct icc_path;
@@ -66,6 +69,25 @@ struct measure_clk_data {
 			the mc clock period
  * @hw:			handle between common and hardware-specific interfaces.
  */
+
+enum clk_debug_vote_backend {
+	CLK_DEBUG_VOTE_NONE,
+	CLK_DEBUG_VOTE_ICC,
+	CLK_DEBUG_VOTE_LEGACY,
+};
+
+struct clk_debug_vote_state {
+	struct mutex lock;
+	struct device *dev;
+	const char *icc_name;
+	bool late_path_owned;
+	struct icc_path *path;
+	u32 bus_cl_id;
+	unsigned int users;
+	enum clk_debug_vote_backend backend;
+	bool shutting_down;
+};
+
 struct clk_debug_mux {
 	int *mux_sels;
 	int *pre_div_vals;
@@ -86,6 +108,8 @@ struct clk_debug_mux {
 	u32 num_icc_paths;
 	struct icc_path *icc_paths[CLK_DEBUG_MAX_ICC_PATHS];
 	struct icc_path *icc_path;
+	unsigned long icc_active_mask;
+	bool legacy_vote_active;
 	struct clk_hw hw;
 };
 
@@ -94,8 +118,20 @@ struct clk_debug_mux {
 extern const struct clk_ops clk_debug_mux_ops;
 
 int clk_debug_measure_register(struct clk_hw *hw);
+void clk_debug_measure_unregister(struct clk_hw *hw);
 void clk_debug_measure_add(struct clk_hw *hw, struct dentry *dentry);
-void clk_debug_bus_vote(struct clk_hw *hw, bool enable);
+int clk_debug_bus_vote(struct clk_hw *hw, bool enable);
+
+int clk_debug_vote_attach(struct device *dev,
+			  struct clk_hw *hw,
+			  struct clk_debug_vote_state *state);
+
+
+struct clk_debug_vote_state *
+clk_debug_vote_state_init(struct device *dev,
+			  struct icc_path *path,
+			  u32 bus_cl_id, const char *icc_name);
+
 int map_debug_bases(struct platform_device *pdev, const char *base,
 		    struct clk_debug_mux *mux);
 

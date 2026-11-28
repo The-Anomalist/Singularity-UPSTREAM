@@ -26,6 +26,8 @@
 #include <linux/perf_event.h>
 #include <linux/of_device.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
+#include <linux/jiffies.h>
 
 enum common_ev_idx {
 	INST_IDX,
@@ -45,14 +47,19 @@ enum mon_type {
 
 struct event_data {
 	struct perf_event *pevent;
-	unsigned long prev_count;
+	u64 prev_count;
+	u64 prev_enabled;
+	u64 prev_running;
 	unsigned long last_delta;
+	bool baseline_valid;
+	bool valid;
 };
 
 struct cpu_data {
 	struct event_data common_evs[NUM_COMMON_EVS];
 	unsigned long freq;
 	unsigned long stall_pct;
+	bool stall_valid;
 };
 
 /**
@@ -97,6 +104,10 @@ struct memlat_mon {
 	struct event_data	*access_ev;
 	struct event_data	*wb_ev;
 	struct memlat_hwmon	hw;
+	struct dev_stats	*snapshot;
+	spinlock_t		snapshot_lock;
+	unsigned long		snapshot_valid_until;
+	bool			snapshot_valid;
 
 	struct memlat_cpu_grp	*cpu_grp;
 };
@@ -145,29 +156,71 @@ struct memlat_mon_spec {
 	enum mon_type type;
 };
 
+static inline unsigned int memlat_cpu_index(
+		const struct cpumask *mask, unsigned int cpu)
+{
+	unsigned int member, index = 0;
+
+	for_each_cpu(member, mask) {
+		if (member == cpu)
+			break;
+		index++;
+	}
+
+	return index;
+}
+
 #define to_cpu_data(cpu_grp, cpu) \
-	(&cpu_grp->cpus_data[cpu - cpumask_first(&cpu_grp->cpus)])
+	(&cpu_grp->cpus_data[memlat_cpu_index(&cpu_grp->cpus, cpu)])
 #define to_common_evs(cpu_grp, cpu) \
-	(cpu_grp->cpus_data[cpu - cpumask_first(&cpu_grp->cpus)].common_evs)
+	(cpu_grp->cpus_data[memlat_cpu_index(&cpu_grp->cpus, cpu)].common_evs)
 #define to_devstats(mon, cpu) \
-	(&mon->hw.core_stats[cpu - cpumask_first(&mon->cpus)])
+	(&mon->hw.core_stats[memlat_cpu_index(&mon->cpus, cpu)])
 #define to_mon(hwmon) container_of(hwmon, struct memlat_mon, hw)
 
 static struct workqueue_struct *memlat_wq;
 
-#define MAX_COUNT_LIM 0xFFFFFFFFFFFFFFFF
 static inline void read_event(struct event_data *event)
 {
-	unsigned long ev_count = 0;
 	u64 total, enabled, running;
+	u64 count_delta, enabled_delta, running_delta;
 
-	if (!event->pevent)
+	event->last_delta = 0;
+	event->valid = false;
+
+	if (!event->pevent) {
+		event->baseline_valid = false;
 		return;
+	}
 
 	total = perf_event_read_value(event->pevent, &enabled, &running);
-	ev_count = total - event->prev_count;
+
+	if (!event->baseline_valid ||
+	    total < event->prev_count ||
+	    enabled < event->prev_enabled ||
+	    running < event->prev_running)
+		goto baseline;
+
+	count_delta = total - event->prev_count;
+	enabled_delta = enabled - event->prev_enabled;
+	running_delta = running - event->prev_running;
+
+	/*
+	 * These counters are pinned. Reject incomplete scheduling
+	 * rather than extrapolating unrelated counter intervals.
+	 */
+	if (enabled_delta && running_delta &&
+	    running_delta == enabled_delta &&
+	    count_delta <= ULONG_MAX) {
+		event->last_delta = count_delta;
+		event->valid = true;
+	}
+
+baseline:
 	event->prev_count = total;
-	event->last_delta = ev_count;
+	event->prev_enabled = enabled;
+	event->prev_running = running;
+	event->baseline_valid = true;
 }
 
 static void update_counts(struct memlat_cpu_grp *cpu_grp)
@@ -190,12 +243,16 @@ static void update_counts(struct memlat_cpu_grp *cpu_grp)
 		for (i = 0; i < NUM_COMMON_EVS; i++)
 			read_event(&common_evs[i]);
 
-		if (!common_evs[STALL_IDX].pevent)
-			common_evs[STALL_IDX].last_delta =
-				common_evs[CYC_IDX].last_delta;
+		cpu_data->stall_valid =
+			common_evs[STALL_IDX].valid &&
+			common_evs[CYC_IDX].valid &&
+			common_evs[CYC_IDX].last_delta;
+
+		if (!cpu_data->stall_valid)
+			common_evs[STALL_IDX].last_delta = 0;
 
 		cpu_data->freq = common_evs[CYC_IDX].last_delta / delta;
-		if (common_evs[CYC_IDX].last_delta)
+		if (cpu_data->stall_valid)
 			cpu_data->stall_pct = min_t(unsigned long, 100,
 				mult_frac(100,
 					 common_evs[STALL_IDX].last_delta,
@@ -212,7 +269,7 @@ static void update_counts(struct memlat_cpu_grp *cpu_grp)
 
 		for_each_cpu(cpu, &mon->cpus) {
 			unsigned int mon_idx =
-				cpu - cpumask_first(&mon->cpus);
+				memlat_cpu_index(&mon->cpus, cpu);
 			read_event(&mon->miss_ev[mon_idx]);
 
 			if (mon->wb_ev_id && mon->access_ev_id) {
@@ -223,21 +280,31 @@ static void update_counts(struct memlat_cpu_grp *cpu_grp)
 	}
 }
 
-static unsigned long get_cnt(struct memlat_hwmon *hw)
+static void publish_snapshot(struct memlat_hwmon *hw)
 {
 	struct memlat_mon *mon = to_mon(hw);
 	struct memlat_cpu_grp *cpu_grp = mon->cpu_grp;
 	unsigned int cpu;
+	unsigned long flags;
+
+	spin_lock_irqsave(&mon->snapshot_lock, flags);
 
 	for_each_cpu(cpu, &mon->cpus) {
 		struct cpu_data *cpu_data = to_cpu_data(cpu_grp, cpu);
 		struct event_data *common_evs = cpu_data->common_evs;
 		unsigned int mon_idx =
-			cpu - cpumask_first(&mon->cpus);
-		struct dev_stats *devstats = to_devstats(mon, cpu);
+			memlat_cpu_index(&mon->cpus, cpu);
+		struct dev_stats *devstats = &mon->snapshot[mon_idx];
 
+		devstats->id = cpu;
+
+		devstats->sample_valid = common_evs[CYC_IDX].valid &&
+			(!mon->miss_ev ||
+			 (common_evs[INST_IDX].valid &&
+			  mon->miss_ev[mon_idx].valid));
 		devstats->freq = cpu_data->freq;
 		devstats->stall_pct = cpu_data->stall_pct;
+		devstats->stall_valid = cpu_data->stall_valid;
 		devstats->inst_count = common_evs[INST_IDX].last_delta;
 
 		if (mon->miss_ev)
@@ -248,8 +315,13 @@ static unsigned long get_cnt(struct memlat_hwmon *hw)
 			devstats->mem_count = 1;
 		}
 
-		if (mon->access_ev_id && mon->wb_ev_id &&
-		    mon->access_ev[mon_idx].last_delta)
+		devstats->wb_valid =
+			mon->access_ev && mon->wb_ev &&
+			mon->access_ev[mon_idx].valid &&
+			mon->wb_ev[mon_idx].valid &&
+			mon->access_ev[mon_idx].last_delta;
+
+		if (devstats->wb_valid)
 			devstats->wb_pct = min_t(unsigned long, 100,
 				mult_frac(100, mon->wb_ev[mon_idx].last_delta,
 					  mon->access_ev[mon_idx].last_delta));
@@ -257,12 +329,69 @@ static unsigned long get_cnt(struct memlat_hwmon *hw)
 			devstats->wb_pct = 0;
 	}
 
+	/*
+	 * Permit scheduling jitter, but do not retain measurements
+	 * indefinitely when polling stops.
+	 */
+	mon->snapshot_valid_until = jiffies +
+		msecs_to_jiffies(max_t(unsigned int, 100,
+				      cpu_grp->update_ms * 3));
+	mon->snapshot_valid = true;
+
+	spin_unlock_irqrestore(&mon->snapshot_lock, flags);
+}
+
+static unsigned long get_cnt(struct memlat_hwmon *hw)
+{
+	struct memlat_mon *mon = to_mon(hw);
+	unsigned long flags;
+	unsigned int i;
+
+	spin_lock_irqsave(&mon->snapshot_lock, flags);
+	memcpy(hw->core_stats, mon->snapshot,
+	       hw->num_cores * sizeof(*hw->core_stats));
+
+	if (!mon->snapshot_valid ||
+	    time_after_eq(jiffies, mon->snapshot_valid_until)) {
+		for (i = 0; i < hw->num_cores; i++) {
+			hw->core_stats[i].sample_valid = false;
+			hw->core_stats[i].stall_valid = false;
+			hw->core_stats[i].wb_valid = false;
+		}
+	}
+	spin_unlock_irqrestore(&mon->snapshot_lock, flags);
+
 	return 0;
 }
 
+static void clear_snapshot(struct memlat_mon *mon)
+{
+	unsigned long flags;
+	unsigned int cpu;
+
+	spin_lock_irqsave(&mon->snapshot_lock, flags);
+
+	mon->snapshot_valid = false;
+	mon->snapshot_valid_until = 0;
+
+	memset(mon->snapshot, 0,
+	       mon->hw.num_cores * sizeof(*mon->snapshot));
+
+	for_each_cpu(cpu, &mon->cpus)
+		mon->snapshot[memlat_cpu_index(&mon->cpus, cpu)].id = cpu;
+
+	spin_unlock_irqrestore(&mon->snapshot_lock, flags);
+}
+
+
 static void delete_event(struct event_data *event)
 {
-	event->prev_count = event->last_delta = 0;
+	event->prev_count = 0;
+	event->prev_enabled = 0;
+	event->prev_running = 0;
+	event->last_delta = 0;
+	event->baseline_valid = false;
+	event->valid = false;
 	if (event->pevent) {
 		perf_event_release_kernel(event->pevent);
 		event->pevent = NULL;
@@ -317,11 +446,11 @@ static int init_common_evs(struct memlat_cpu_grp *cpu_grp,
 			ret = set_event(&common_evs[i], cpu,
 					cpu_grp->common_ev_ids[i], attr);
 			if (ret)
-				break;
+				return ret;
 		}
 	}
 
-	return ret;
+	return 0;
 }
 
 static void free_common_evs(struct memlat_cpu_grp *cpu_grp)
@@ -345,7 +474,7 @@ static void memlat_monitor_work(struct work_struct *work)
 	unsigned int i;
 
 	mutex_lock(&cpu_grp->mons_lock);
-	if (!cpu_grp->num_active_mons)
+	if (!cpu_grp->num_active_mons || !cpu_grp->update_ms)
 		goto unlock_out;
 	update_counts(cpu_grp);
 	for (i = 0; i < cpu_grp->num_mons; i++) {
@@ -353,11 +482,20 @@ static void memlat_monitor_work(struct work_struct *work)
 
 		mon = &cpu_grp->mons[i];
 
-		if (!mon->is_active)
+		if (!mon->is_active || !mon->requested_update_ms)
 			continue;
+
+		publish_snapshot(&mon->hw);
 
 		df = mon->hw.df;
 		mutex_lock(&df->lock);
+
+		if (READ_ONCE(df->dev_suspended) ||
+		    df->stop_polling) {
+			mutex_unlock(&df->lock);
+			continue;
+		}
+
 		err = update_devfreq(df);
 		if (err)
 			dev_err(mon->hw.dev, "Memlat update failed: %d\n", err);
@@ -370,6 +508,24 @@ static void memlat_monitor_work(struct work_struct *work)
 unlock_out:
 	mutex_unlock(&cpu_grp->mons_lock);
 }
+
+static void free_mon_events(struct memlat_mon *mon)
+{
+	unsigned int cpu;
+
+	for_each_cpu(cpu, &mon->cpus) {
+		unsigned int idx = memlat_cpu_index(&mon->cpus, cpu);
+
+		if (mon->miss_ev)
+			delete_event(&mon->miss_ev[idx]);
+		if (mon->access_ev)
+			delete_event(&mon->access_ev[idx]);
+		if (mon->wb_ev)
+			delete_event(&mon->wb_ev[idx]);
+	}
+}
+
+static void set_update_ms(struct memlat_cpu_grp *cpu_grp);
 
 static int start_hwmon(struct memlat_hwmon *hw)
 {
@@ -384,45 +540,57 @@ static int start_hwmon(struct memlat_hwmon *hw)
 		return -ENOMEM;
 
 	mutex_lock(&cpu_grp->mons_lock);
-	should_init_cpu_grp = !(cpu_grp->num_active_mons++);
+	if (mon->is_active) {
+		ret = -EBUSY;
+		goto unlock_out;
+	}
+
+	should_init_cpu_grp = !cpu_grp->num_active_mons;
 	if (should_init_cpu_grp) {
 		ret = init_common_evs(cpu_grp, attr);
 		if (ret)
-			goto unlock_out;
+			goto rollback;
 
-		INIT_DEFERRABLE_WORK(&cpu_grp->work, &memlat_monitor_work);
 		/* Start the rate window when counters start, not at probe time. */
 		cpu_grp->last_update_ts = ktime_get();
 	}
 
 	if (mon->miss_ev) {
 		for_each_cpu(cpu, &mon->cpus) {
-			unsigned int idx = cpu - cpumask_first(&mon->cpus);
+			unsigned int idx = memlat_cpu_index(&mon->cpus, cpu);
 
 			ret = set_event(&mon->miss_ev[idx], cpu,
 					mon->miss_ev_id, attr);
 			if (ret)
-				goto unlock_out;
+				goto rollback;
 
 			if (mon->access_ev_id && mon->wb_ev_id) {
 				ret = set_event(&mon->access_ev[idx], cpu,
 						mon->access_ev_id, attr);
 				if (ret)
-					goto unlock_out;
+					goto rollback;
 
 				ret = set_event(&mon->wb_ev[idx], cpu,
 						mon->wb_ev_id, attr);
 				if (ret)
-					goto unlock_out;
+					goto rollback;
 			}
 		}
 	}
 
+	clear_snapshot(mon);
 	mon->is_active = true;
+	cpu_grp->num_active_mons++;
 
+	mon->requested_update_ms = hw->df->profile->polling_ms;
+	set_update_ms(cpu_grp);
+
+	goto unlock_out;
+
+rollback:
+	free_mon_events(mon);
 	if (should_init_cpu_grp)
-		queue_delayed_work(memlat_wq, &cpu_grp->work,
-				   msecs_to_jiffies(cpu_grp->update_ms));
+		free_common_evs(cpu_grp);
 
 unlock_out:
 	mutex_unlock(&cpu_grp->mons_lock);
@@ -433,31 +601,25 @@ unlock_out:
 
 static void stop_hwmon(struct memlat_hwmon *hw)
 {
-	unsigned int cpu;
 	struct memlat_mon *mon = to_mon(hw);
 	struct memlat_cpu_grp *cpu_grp = mon->cpu_grp;
 
 	mutex_lock(&cpu_grp->mons_lock);
+	if (!mon->is_active) {
+		mutex_unlock(&cpu_grp->mons_lock);
+		return;
+	}
+
 	mon->is_active = false;
 	cpu_grp->num_active_mons--;
+	free_mon_events(mon);
 
-	for_each_cpu(cpu, &mon->cpus) {
-		unsigned int idx = cpu - cpumask_first(&mon->cpus);
-		struct dev_stats *devstats = to_devstats(mon, cpu);
+	clear_snapshot(mon);
 
-		if (mon->miss_ev)
-			delete_event(&mon->miss_ev[idx]);
-		devstats->inst_count = 0;
-		devstats->mem_count = 0;
-		devstats->freq = 0;
-		devstats->stall_pct = 0;
-		devstats->wb_pct = 0;
-	}
+	set_update_ms(cpu_grp);
 
-	if (!cpu_grp->num_active_mons) {
-		cancel_delayed_work(&cpu_grp->work);
+	if (!cpu_grp->num_active_mons)
 		free_common_evs(cpu_grp);
-	}
 	mutex_unlock(&cpu_grp->mons_lock);
 }
 
@@ -478,10 +640,12 @@ static void set_update_ms(struct memlat_cpu_grp *cpu_grp)
 				min(new_update_ms, mon->requested_update_ms);
 	}
 
-	if (new_update_ms == UINT_MAX) {
+	if (new_update_ms == UINT_MAX)
+		new_update_ms = 0;
+
+	if (!new_update_ms) {
 		cancel_delayed_work(&cpu_grp->work);
 	} else if (new_update_ms != cpu_grp->update_ms) {
-		/* Apply faster requests without waiting for the old period. */
 		mod_delayed_work(memlat_wq, &cpu_grp->work,
 				 msecs_to_jiffies(new_update_ms));
 	}
@@ -614,12 +778,15 @@ static int memlat_cpu_grp_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	mutex_init(&cpu_grp->mons_lock);
-	cpu_grp->update_ms = DEFAULT_UPDATE_MS;
+	INIT_DEFERRABLE_WORK(&cpu_grp->work, &memlat_monitor_work);
+	cpu_grp->update_ms = 0;
 
 	dev_set_drvdata(dev, cpu_grp);
 
 	return 0;
 }
+
+static DEFINE_MUTEX(memlat_probe_lock);
 
 static int memlat_mon_probe(struct platform_device *pdev, bool is_compute)
 {
@@ -630,22 +797,34 @@ static int memlat_mon_probe(struct platform_device *pdev, bool is_compute)
 	struct memlat_hwmon *hw;
 	unsigned int event_id, num_cpus, cpu;
 
+	mutex_lock(&memlat_probe_lock);
+
 	if (!memlat_wq)
 		memlat_wq = create_freezable_workqueue("memlat_wq");
 
 	if (!memlat_wq) {
 		dev_err(dev, "Couldn't create memlat workqueue.\n");
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto unlock_probe;
 	}
 
 	cpu_grp = dev_get_drvdata(dev->parent);
 	if (!cpu_grp) {
 		dev_err(dev, "Mon initialized without cpu_grp.\n");
-		return -ENODEV;
+		ret = -ENODEV;
+		goto unlock_probe;
 	}
 
 	mutex_lock(&cpu_grp->mons_lock);
+	if (cpu_grp->num_inited_mons >= cpu_grp->num_mons) {
+		ret = -EINVAL;
+		goto unlock_out;
+	}
+
 	mon = &cpu_grp->mons[cpu_grp->num_inited_mons];
+
+	/* A previous failed probe may have left stale devres pointers. */
+	memset(mon, 0, sizeof(*mon));
 	mon->is_active = false;
 	mon->requested_update_ms = 0;
 	mon->cpu_grp = cpu_grp;
@@ -681,6 +860,16 @@ static int memlat_mon_probe(struct platform_device *pdev, bool is_compute)
 		goto unlock_out;
 	}
 
+	mon->snapshot = devm_kcalloc(dev, num_cpus,
+				    sizeof(*mon->snapshot), GFP_KERNEL);
+	if (!mon->snapshot) {
+		ret = -ENOMEM;
+		goto unlock_out;
+	}
+
+	spin_lock_init(&mon->snapshot_lock);
+	clear_snapshot(mon);
+
 	for_each_cpu(cpu, &mon->cpus)
 		to_devstats(mon, cpu)->id = cpu;
 
@@ -698,7 +887,6 @@ static int memlat_mon_probe(struct platform_device *pdev, bool is_compute)
 		mon->miss_ev_id = 0;
 		mon->access_ev_id = 0;
 		mon->wb_ev_id = 0;
-		ret = register_compute(dev, hw);
 	} else {
 		mon->miss_ev =
 			devm_kzalloc(dev, num_cpus * sizeof(*mon->miss_ev),
@@ -751,14 +939,33 @@ static int memlat_mon_probe(struct platform_device *pdev, bool is_compute)
 			}
 		}
 
-		ret = register_memlat(dev, hw);
 	}
 
-	if (!ret)
-		cpu_grp->num_inited_mons++;
+	/*
+	 * Publish the fully initialized slot before registration.
+	 * Governor registration may synchronously start the monitor.
+	 * The probe mutex prevents another probe from reusing this slot.
+	 */
+	cpu_grp->num_inited_mons++;
+	mutex_unlock(&cpu_grp->mons_lock);
+
+	if (is_compute)
+		ret = register_compute(dev, hw);
+	else
+		ret = register_memlat(dev, hw);
+
+	if (ret) {
+		mutex_lock(&cpu_grp->mons_lock);
+		cpu_grp->num_inited_mons--;
+		mutex_unlock(&cpu_grp->mons_lock);
+	}
+
+	goto unlock_probe;
 
 unlock_out:
 	mutex_unlock(&cpu_grp->mons_lock);
+unlock_probe:
+	mutex_unlock(&memlat_probe_lock);
 	return ret;
 }
 

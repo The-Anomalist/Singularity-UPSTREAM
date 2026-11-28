@@ -1019,6 +1019,34 @@ static const struct of_device_id clk_debug_match_table[] = {
 	{ }
 };
 
+
+static void kona_debugcc_unregister_measure(void *data)
+{
+	struct clk_hw *hw = data;
+
+	clk_debug_measure_unregister(hw);
+}
+
+static void kona_debugcc_release_resources(void *data)
+{
+	struct clk_debug_mux *mux = data;
+	int i;
+
+	if (mux->bus_cl_id) {
+		msm_bus_scale_unregister_client(mux->bus_cl_id);
+		mux->bus_cl_id = 0;
+	}
+
+	for (i = 0; i < CLK_DEBUG_MAX_ICC_PATHS; i++)
+		mux->icc_paths[i] = NULL;
+
+	mux->icc_path = NULL;
+	mux->num_icc_paths = 0;
+	mux->icc_active_mask = 0;
+	mux->legacy_vote_active = false;
+	debug_mux_priv.cxo = NULL;
+}
+
 static int clk_debug_kona_probe(struct platform_device *pdev)
 {
 	static const char * const icc_names[] = {
@@ -1051,29 +1079,45 @@ static int clk_debug_kona_probe(struct platform_device *pdev)
 		return PTR_ERR(clk);
 	}
 
-	debug_mux_priv.cxo = clk;
-	for (i = 0; i < ARRAY_SIZE(icc_names); i++) {
-		gcc_debug_mux.icc_paths[i] = devm_of_icc_get(&pdev->dev,
-							     icc_names[i]);
-		if (IS_ERR(gcc_debug_mux.icc_paths[i])) {
-			dev_dbg(&pdev->dev,
-				"ICC path %s unavailable (%ld), using msm_bus fallback\n",
-				icc_names[i],
-				PTR_ERR(gcc_debug_mux.icc_paths[i]));
-			gcc_debug_mux.icc_paths[i] = NULL;
-			break;
-		}
-	}
+	/*
+	 * Acquire all required paths before publishing runtime resources.
+	 * A described but unavailable ICC provider must defer probe.
+	 */
+	if (IS_ENABLED(CONFIG_INTERCONNECT) &&
+	    of_find_property(pdev->dev.of_node, "interconnects", NULL)) {
+		struct icc_path *paths[CLK_DEBUG_MAX_ICC_PATHS];
 
-	if (i == ARRAY_SIZE(icc_names)) {
+		BUILD_BUG_ON(ARRAY_SIZE(icc_names) !=
+			     CLK_DEBUG_MAX_ICC_PATHS);
+
+		for (i = 0; i < ARRAY_SIZE(icc_names); i++) {
+			paths[i] = devm_of_icc_get(&pdev->dev,
+						  icc_names[i]);
+			if (IS_ERR(paths[i]))
+				return PTR_ERR(paths[i]);
+
+			if (!paths[i])
+				return -ENODEV;
+		}
+
+		for (i = 0; i < ARRAY_SIZE(icc_names); i++)
+			gcc_debug_mux.icc_paths[i] = paths[i];
+
 		gcc_debug_mux.num_icc_paths = ARRAY_SIZE(icc_names);
 	} else {
-		gcc_debug_mux.num_icc_paths = 0;
 		gcc_debug_mux.bus_cl_id =
 			msm_bus_scale_register_client(&clk_measure_scale_table);
+
 		if (!gcc_debug_mux.bus_cl_id)
 			return -EPROBE_DEFER;
 	}
+
+	debug_mux_priv.cxo = clk;
+
+	ret = devm_add_action_or_reset(&pdev->dev,
+			kona_debugcc_release_resources, &gcc_debug_mux);
+	if (ret)
+		return ret;
 
 	for (i = 0; i < ARRAY_SIZE(mux_list); i++) {
 		ret = map_debug_bases(pdev, mux_list[i].regmap_name,
@@ -1101,10 +1145,14 @@ static int clk_debug_kona_probe(struct platform_device *pdev)
 	}
 
 	ret = clk_debug_measure_register(&gcc_debug_mux.hw);
-	if (ret)
+	if (ret) {
 		dev_err(&pdev->dev, "Could not register Measure clock\n");
+		return ret;
+	}
 
-	return ret;
+	return devm_add_action_or_reset(&pdev->dev,
+			kona_debugcc_unregister_measure,
+			&gcc_debug_mux.hw);
 }
 
 static struct platform_driver clk_debug_driver = {

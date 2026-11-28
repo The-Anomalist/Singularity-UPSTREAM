@@ -17,6 +17,7 @@
 #include <linux/list.h>
 #include <linux/devfreq.h>
 #include <linux/pm_opp.h>
+#include <linux/notifier.h>
 
 #define INIT_HZ				300000000UL
 #define XO_HZ				19200000UL
@@ -31,6 +32,7 @@ struct devfreq_qcom_fw {
 	void __iomem *perf_base;
 	void __iomem *pstate_base;
 	struct devfreq_dev_profile dp;
+	struct notifier_block panic_notifier;
 	struct list_head voters;
 	struct list_head voter;
 	unsigned int index;
@@ -38,7 +40,6 @@ struct devfreq_qcom_fw {
 
 static DEFINE_SPINLOCK(voter_lock);
 static unsigned int ftbl_row_size = FTBL_ROW_SIZE;
-static struct device *dev_node;
 
 static int devfreq_qcom_fw_target(struct device *dev, unsigned long *freq,
 				  u32 flags)
@@ -65,9 +66,8 @@ static int devfreq_qcom_fw_target(struct device *dev, unsigned long *freq,
 		return -EINVAL;
 	}
 
-	d->index = index;
-
 	spin_lock_irqsave(&voter_lock, lflags);
+	WRITE_ONCE(d->index, index);
 	/* Voter */
 	if (!perf_base) {
 		pd = dev_get_drvdata(dev->parent);
@@ -85,7 +85,9 @@ static int devfreq_qcom_fw_target(struct device *dev, unsigned long *freq,
 static int devfreq_panic_callback(struct notifier_block *nfb,
 					unsigned long event, void *unused)
 {
-	struct devfreq_qcom_fw *d = dev_get_drvdata(dev_node);
+	struct devfreq_qcom_fw *d =
+		container_of(nfb, struct devfreq_qcom_fw,
+			     panic_notifier);
 	void __iomem *base;
 
 	pr_err("%s: L3-DOMAIN\n", __func__);
@@ -97,10 +99,27 @@ static int devfreq_panic_callback(struct notifier_block *nfb,
 	return NOTIFY_OK;
 }
 
-static struct notifier_block devfreq_panic_notifier = {
-	.notifier_call = devfreq_panic_callback,
-	.priority = 1,
-};
+static void devfreq_qcom_unregister_panic(void *data)
+{
+	struct devfreq_qcom_fw *d = data;
+
+	atomic_notifier_chain_unregister(&panic_notifier_list,
+					 &d->panic_notifier);
+}
+
+static void devfreq_qcom_remove_parent_opp(void *data)
+{
+	struct device *dev = data;
+
+	dev_pm_opp_remove_table(dev);
+}
+
+static void devfreq_qcom_depopulate(void *data)
+{
+	struct device *dev = data;
+
+	of_platform_depopulate(dev);
+}
 
 static int devfreq_qcom_fw_get_cur_freq(struct device *dev,
 						 unsigned long *freq)
@@ -111,7 +130,7 @@ static int devfreq_qcom_fw_get_cur_freq(struct device *dev,
 
 	/* Voter */
 	if (!d->perf_base) {
-		index = d->index;
+		index = READ_ONCE(d->index);
 	} else {
 		index = readl_relaxed(d->perf_base);
 		index = min(index, p->max_state - 1);
@@ -237,13 +256,30 @@ static int devfreq_qcom_init_hw(struct platform_device *pdev)
 			goto out;
 		}
 
-		atomic_notifier_chain_register(&panic_notifier_list,
-						&devfreq_panic_notifier);
-		dev_node = dev;
+		d->panic_notifier.notifier_call =
+			devfreq_panic_callback;
+		d->panic_notifier.priority = 1;
+
+		ret = atomic_notifier_chain_register(
+			&panic_notifier_list, &d->panic_notifier);
+		if (ret)
+			goto out;
+
+		ret = devm_add_action_or_reset(dev,
+				devfreq_qcom_unregister_panic, d);
+		if (ret)
+			goto out;
 	}
 
 	INIT_LIST_HEAD(&d->voters);
+
+	ret = devm_add_action_or_reset(dev,
+			devfreq_qcom_remove_parent_opp, dev);
+	if (ret)
+		return ret;
+
 	dev_set_drvdata(dev, d);
+	return 0;
 
 out:
 	if (ret)
@@ -261,8 +297,8 @@ static int devfreq_qcom_copy_opp(struct device *src_dev, struct device *dst_dev)
 		return -ENODEV;
 
 	cnt = dev_pm_opp_get_opp_count(src_dev);
-	if (!cnt)
-		return -EINVAL;
+	if (cnt <= 0)
+		return cnt < 0 ? cnt : -EINVAL;
 
 	for (i = 0, freq = 0; i < cnt; i++, freq++) {
 		opp = dev_pm_opp_find_freq_ceil(src_dev, &freq);
@@ -282,12 +318,40 @@ static int devfreq_qcom_copy_opp(struct device *src_dev, struct device *dst_dev)
 	return ret;
 }
 
+static void devfreq_qcom_remove_voter(void *data)
+{
+	struct device *dev = data;
+	struct devfreq_qcom_fw *d = dev_get_drvdata(dev);
+	struct devfreq_qcom_fw *pd = dev_get_drvdata(dev->parent);
+	struct devfreq_qcom_fw *v;
+	unsigned long flags;
+	unsigned int index = 0;
+
+	spin_lock_irqsave(&voter_lock, flags);
+
+	list_del_init(&d->voter);
+
+	list_for_each_entry(v, &pd->voters, voter)
+		index = max(index, v->index);
+
+	writel_relaxed(index, pd->perf_base);
+
+	spin_unlock_irqrestore(&voter_lock, flags);
+
+	dev_pm_opp_remove_table(dev);
+	dev_set_drvdata(dev, NULL);
+}
+
 static int devfreq_qcom_init_voter(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct device *par_dev = dev->parent;
 	struct devfreq_qcom_fw *d, *pd = dev_get_drvdata(par_dev);
 	int ret = 0;
+	unsigned long flags;
+
+	if (!pd || !pd->perf_base)
+		return -EPROBE_DEFER;
 
 	d = devm_kzalloc(dev, sizeof(*d), GFP_KERNEL);
 	if (!d)
@@ -299,10 +363,15 @@ static int devfreq_qcom_init_voter(struct platform_device *pdev)
 		return ret;
 	}
 
+	INIT_LIST_HEAD(&d->voter);
+
+	spin_lock_irqsave(&voter_lock, flags);
 	list_add(&d->voter, &pd->voters);
+	spin_unlock_irqrestore(&voter_lock, flags);
 	dev_set_drvdata(dev, d);
 
-	return 0;
+	return devm_add_action_or_reset(dev,
+				       devfreq_qcom_remove_voter, dev);
 }
 
 static int devfreq_qcom_fw_driver_probe(struct platform_device *pdev)
@@ -326,7 +395,17 @@ static int devfreq_qcom_fw_driver_probe(struct platform_device *pdev)
 	 * If device has voter children, do no register directly with devfreq
 	 */
 	if (of_get_available_child_count(dev->of_node)) {
-		of_platform_populate(dev->of_node, NULL, NULL, dev);
+		ret = of_platform_populate(dev->of_node,
+					   NULL, NULL, dev);
+		if (ret) {
+			of_platform_depopulate(dev);
+			return ret;
+		}
+
+		ret = devm_add_action_or_reset(dev,
+				devfreq_qcom_depopulate, dev);
+		if (ret)
+			return ret;
 		dev_info(dev, "Devfreq QCOM Firmware parent dev inited.\n");
 		return 0;
 	}

@@ -3,6 +3,7 @@
 
 #define pr_fmt(fmt) "clk: %s: " fmt, __func__
 
+#include "clk-debug.h"
 #include <linux/bitops.h>
 #include <linux/clk.h>
 #include <linux/clk-provider.h>
@@ -31,69 +32,26 @@
 #include "vdd-level.h"
 
 /*
- * Kona clock controllers may provide multiple interconnect specifiers.
- * Historically we used devm_of_icc_get(dev, NULL) which returns the *first*
- * specifier; after adding cfg-style clients, that ordering can change.
- *
- * Try common interconnect-names first so we bind to the intended path, and
- * fall back to the first unnamed specifier (or msm_bus) if unavailable.
+ * Resolve only the controller's dedicated configuration path.
+ * Preserve provider errors, including deferred probe.
+ * Legacy-only device trees remain supported.
  */
-static struct icc_path *kona_cc_get_icc_path(struct device *dev, const char *who)
+static struct icc_path *kona_cc_get_icc_path(struct device *dev)
 {
-	static const char * const try_names[] = {
-		/* Legacy Kona names. */
-		"camcc",
-		"dispcc",
-		"videocc",
-		/* Common 2025/2026 DT naming styles. */
-		"cam",
-		"disp",
-		"video",
-		"cfg",
-		"cam-cfg",
-		"disp-cfg",
-		"video-cfg",
-		"mm-noc",
-		"mnoc",
-		"mem-noc",
-		"snoc",
-		NULL, /* sentinel */
-	};
 	struct icc_path *path;
-	int i;
 
-	/* First try a controller-specific interconnect name. */
-	path = devm_of_icc_get(dev, who);
-	if (!IS_ERR(path))
+	if (!IS_ENABLED(CONFIG_INTERCONNECT))
+		return NULL;
+
+	if (!of_find_property(dev->of_node, "interconnects", NULL))
+		return NULL;
+
+	path = devm_of_icc_get(dev, "cam-cfg");
+	if (IS_ERR(path))
 		return path;
 
-	for (i = 0; try_names[i]; i++) {
-		path = devm_of_icc_get(dev, try_names[i]);
-		if (!IS_ERR(path))
-			return path;
-
-		/* If provider isn't ready yet, keep msm_bus fallback. */
-		if (PTR_ERR(path) == -EPROBE_DEFER) {
-			dev_dbg(dev,
-				"%s: ICC provider not ready (%s), using msm_bus fallback\n",
-				who, try_names[i]);
-			return NULL;
-		}
-	}
-
-	/* Fallback to the first specifier (legacy behavior). */
-	path = devm_of_icc_get(dev, NULL);
-	if (IS_ERR(path)) {
-		if (PTR_ERR(path) == -EPROBE_DEFER)
-			dev_dbg(dev,
-				"%s: ICC provider not ready (unnamed), using msm_bus fallback\n",
-				who);
-		else
-			dev_dbg(dev,
-				"%s: ICC unavailable (%ld), using msm_bus fallback\n",
-				who, PTR_ERR(path));
-		return NULL;
-	}
+	if (!path)
+		return ERR_PTR(-ENODEV);
 
 	return path;
 }
@@ -2809,6 +2767,7 @@ static int cam_cc_kona_probe(struct platform_device *pdev)
 	struct regmap *regmap;
 	struct clk *clk;
 	struct icc_path *icc_path;
+	struct clk_debug_vote_state *vote_state;
 	int ret, i;
 	unsigned int camcc_bus_id = 0;
 
@@ -2842,23 +2801,36 @@ static int cam_cc_kona_probe(struct platform_device *pdev)
 		return PTR_ERR(vdd_mm.regulator[0]);
 	}
 
-	/* Always register msm_bus client as a fallback for bandwidth voting */
+	/* Resolve ICC before registering the legacy fallback client. */
+	icc_path = kona_cc_get_icc_path(&pdev->dev);
+	if (IS_ERR(icc_path)) {
+		dev_warn(&pdev->dev,
+			 "ICC cfg path unavailable (%ld), trying msm_bus fallback\n",
+			 PTR_ERR(icc_path));
+		icc_path = NULL;
+	}
+
 	camcc_bus_id = msm_bus_scale_register_client(&clk_debugfs_scale_table);
 	if (!camcc_bus_id)
 		dev_warn(&pdev->dev, "msm_bus fallback bw voting unavailable\n");
 
-	icc_path = kona_cc_get_icc_path(&pdev->dev, "camcc");
 	if (icc_path && camcc_bus_id)
 		dev_info(&pdev->dev,
-			 "camcc: ICC path attached; msm_bus fallback kept for transient ICC deferrals\n");
+			 "camcc: ICC path attached; msm_bus fallback kept for transient vote failures\n");
+
+
+	vote_state = clk_debug_vote_state_init(
+			&pdev->dev, icc_path, camcc_bus_id, "cam-cfg");
+	if (IS_ERR(vote_state))
+		return PTR_ERR(vote_state);
 
 	for (i = 0; i < ARRAY_SIZE(cam_cc_kona_clocks); i++)
 		if (cam_cc_kona_clocks[i]) {
-			*(unsigned int *)(void *)
-			&cam_cc_kona_clocks[i]->hw.init->bus_cl_id = camcc_bus_id;
-			*(struct icc_path **)(void *)
-			&cam_cc_kona_clocks[i]->hw.init->icc_path =
-				icc_path;
+			ret = clk_debug_vote_attach(&pdev->dev,
+				&cam_cc_kona_clocks[i]->hw,
+				vote_state);
+			if (ret)
+				return ret;
 		}
 
 	clk_lucid_pll_configure(&cam_cc_pll0, regmap, &cam_cc_pll0_config);

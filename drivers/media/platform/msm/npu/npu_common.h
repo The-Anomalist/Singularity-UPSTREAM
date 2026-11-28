@@ -225,6 +225,12 @@ struct npu_io_data {
 #define MBYTE (1ULL << 20)
 
 struct npu_bwctrl {
+	struct mutex lock;
+	bool state_unknown;
+	int core_ib;
+	int core_ab;
+	int ssr_ib;
+	int ssr_ab;
 	struct msm_bus_vectors vectors[MAX_PATHS * DBL_BUF];
 	struct msm_bus_paths bw_levels[DBL_BUF];
 	struct msm_bus_scale_pdata bw_data;
@@ -333,6 +339,8 @@ void disable_fw(struct npu_device *npu_dev);
 int load_fw(struct npu_device *npu_dev);
 int unload_fw(struct npu_device *npu_dev);
 int npu_set_bw(struct npu_device *npu_dev, int new_ib, int new_ab);
+int npu_set_ssr_bw(struct npu_device *npu_dev,
+		int new_ib, int new_ab);
 int npu_notify_cdsprm_cxlimit_activity(struct npu_device *npu_dev, bool enable);
 int npu_bridge_mbox_send_data(struct npu_host_ctx *host_ctx,
 	struct npu_mbox *mbox, void *data);

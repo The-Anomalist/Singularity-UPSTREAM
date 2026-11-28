@@ -12,6 +12,7 @@
 #include <linux/io.h>
 #include <linux/delay.h>
 #include <linux/ktime.h>
+#include <linux/jiffies.h>
 #include <linux/time.h>
 #include <linux/err.h>
 #include <linux/errno.h>
@@ -26,6 +27,9 @@
 
 #include <trace/events/power.h>
 
+#define MEMLAT_INVALID_HOLD_MS 500
+#define MEMLAT_INVALID_DECAY_MS 100
+
 struct memlat_node {
 	unsigned int ratio_ceil;
 	unsigned int stall_floor;
@@ -39,6 +43,10 @@ struct memlat_node {
 	unsigned int min_freq_persist_pct;
 	unsigned int perf_increase_pct;
 	unsigned long prev_req_freq;
+	unsigned long invalid_since;
+	unsigned long invalid_last_decay;
+	unsigned long invalid_vote;
+	bool invalid_pending;
 	bool mon_started;
 	bool already_zero;
 	struct list_head list;
@@ -92,24 +100,60 @@ static struct memlat_node *find_memlat_node(struct devfreq *df)
 	return found;
 }
 
+static void memlat_reset_invalid(struct memlat_node *node)
+{
+	node->invalid_pending = false;
+	node->invalid_since = 0;
+	node->invalid_last_decay = 0;
+	node->invalid_vote = 0;
+}
+
 static int start_monitor(struct devfreq *df)
 {
 	struct memlat_node *node = df->data;
 	struct memlat_hwmon *hw = node->hw;
 	struct device *dev = df->dev.parent;
+	bool old_stop_polling;
 	int ret;
 
-	ret = hw->start_hwmon(hw);
+	mutex_lock(&df->lock);
 
+	old_stop_polling = df->stop_polling;
+	node->mon_started = false;
+	node->resume_freq = 0;
+	node->prev_req_freq = 0;
+	node->already_zero = false;
+	memlat_reset_invalid(node);
+
+	if (hw->should_ignore_df_monitor)
+		df->stop_polling = true;
+
+	mutex_unlock(&df->lock);
+
+	/*
+	 * HW monitor lifecycle takes mons_lock.
+	 * Never hold df->lock across these callbacks.
+	 */
+	ret = hw->start_hwmon(hw);
 	if (ret) {
+		mutex_lock(&df->lock);
+		df->stop_polling = old_stop_polling;
+		mutex_unlock(&df->lock);
+
 		dev_err(dev, "Unable to start HW monitor! (%d)\n", ret);
 		return ret;
 	}
 
-	if (!hw->should_ignore_df_monitor)
-		devfreq_monitor_start(df);
+	mutex_lock(&df->lock);
 
 	node->mon_started = true;
+	if (hw->should_ignore_df_monitor)
+		df->stop_polling = false;
+
+	mutex_unlock(&df->lock);
+
+	if (!hw->should_ignore_df_monitor)
+		devfreq_monitor_start(df);
 
 	return 0;
 }
@@ -119,7 +163,18 @@ static void stop_monitor(struct devfreq *df)
 	struct memlat_node *node = df->data;
 	struct memlat_hwmon *hw = node->hw;
 
+	mutex_lock(&df->lock);
+
 	node->mon_started = false;
+	node->resume_freq = 0;
+	node->prev_req_freq = 0;
+	node->already_zero = false;
+	memlat_reset_invalid(node);
+
+	if (hw->should_ignore_df_monitor)
+		df->stop_polling = true;
+
+	mutex_unlock(&df->lock);
 
 	if (!hw->should_ignore_df_monitor)
 		devfreq_monitor_stop(df);
@@ -160,34 +215,63 @@ err_start:
 static int gov_suspend(struct devfreq *df)
 {
 	struct memlat_node *node = df->data;
-	unsigned long prev_freq = df->previous_freq;
+	struct memlat_hwmon *hw = node->hw;
+	unsigned long prev_freq;
+	int ret;
 
-	node->mon_started = false;
-	devfreq_monitor_suspend(df);
+	if (!hw->should_ignore_df_monitor)
+		devfreq_monitor_suspend(df);
 
 	mutex_lock(&df->lock);
-	update_devfreq(df);
+
+	prev_freq = df->previous_freq;
+	if (hw->should_ignore_df_monitor)
+		df->stop_polling = true;
+	node->mon_started = false;
+	node->resume_freq = 0;
+	memlat_reset_invalid(node);
+
+	ret = update_devfreq(df);
+	if (ret) {
+		node->mon_started = true;
+		if (hw->should_ignore_df_monitor)
+			df->stop_polling = false;
+	} else {
+		node->resume_freq = max(prev_freq, 1UL);
+	}
+
 	mutex_unlock(&df->lock);
 
-	node->resume_freq = max(prev_freq, 1UL);
+	if (ret && !hw->should_ignore_df_monitor)
+		devfreq_monitor_resume(df);
 
-	return 0;
+	return ret;
 }
 
 static int gov_resume(struct devfreq *df)
 {
 	struct memlat_node *node = df->data;
+	struct memlat_hwmon *hw = node->hw;
+	int ret;
 
 	mutex_lock(&df->lock);
-	update_devfreq(df);
+
+	ret = update_devfreq(df);
+	if (!ret) {
+		node->resume_freq = 0;
+		memlat_reset_invalid(node);
+		node->prev_req_freq = df->previous_freq;
+		node->mon_started = true;
+		if (hw->should_ignore_df_monitor)
+			df->stop_polling = false;
+	}
+
 	mutex_unlock(&df->lock);
 
-	node->resume_freq = 0;
+	if (!ret && !hw->should_ignore_df_monitor)
+		devfreq_monitor_resume(df);
 
-	devfreq_monitor_resume(df);
-	node->mon_started = true;
-
-	return 0;
+	return ret;
 }
 
 static void gov_stop(struct devfreq *df)
@@ -208,7 +292,9 @@ static int devfreq_memlat_get_freq(struct devfreq *df,
 	struct memlat_node *node = df->data;
 	struct memlat_hwmon *hw = node->hw;
 	unsigned long max_freq = 0, peak_core_freq = 0;
-	unsigned int ratio, dyn_boost_pct = 0;
+	unsigned long ratio;
+	unsigned int dyn_boost_pct = 0;
+	bool valid_sample_seen = false;
 	unsigned int dyn_persist_pct = node->min_freq_persist_pct;
 	bool pressure_seen = false;
 
@@ -232,6 +318,11 @@ static int devfreq_memlat_get_freq(struct devfreq *df,
 		if (hw->core_stats[i].mem_count)
 			ratio /= hw->core_stats[i].mem_count;
 
+		if (!hw->core_stats[i].sample_valid)
+			continue;
+
+		valid_sample_seen = true;
+
 		if (!hw->core_stats[i].freq)
 			continue;
 
@@ -249,8 +340,10 @@ static int devfreq_memlat_get_freq(struct devfreq *df,
 					hw->core_stats[i].wb_pct, ratio);
 
 		if (((ratio <= node->ratio_ceil
-		      && hw->core_stats[i].stall_pct >= node->stall_floor) ||
-		      (hw->core_stats[i].wb_pct >= node->wb_pct_thres
+		      && (!hw->core_stats[i].stall_valid ||
+			  hw->core_stats[i].stall_pct >= node->stall_floor)) ||
+		      (hw->core_stats[i].wb_valid &&
+		      hw->core_stats[i].wb_pct >= node->wb_pct_thres
 		      && ratio <= node->wb_filter_ratio))
 		      && (hw->core_stats[i].freq > max_freq)) {
 			lat_dev = i;
@@ -260,7 +353,8 @@ static int devfreq_memlat_get_freq(struct devfreq *df,
 		if (node->boost_pct) {
 			unsigned int stall_boost = 0, wb_boost = 0;
 
-			if (hw->core_stats[i].stall_pct > node->boost_stall_floor) {
+			if (hw->core_stats[i].stall_valid &&
+			    hw->core_stats[i].stall_pct > node->boost_stall_floor) {
 				stall_boost = mult_frac(node->boost_pct,
 						hw->core_stats[i].stall_pct -
 						node->boost_stall_floor,
@@ -268,7 +362,8 @@ static int devfreq_memlat_get_freq(struct devfreq *df,
 						100 - node->boost_stall_floor));
 			}
 
-			if (hw->core_stats[i].wb_pct > node->boost_wb_pct) {
+			if (hw->core_stats[i].wb_valid &&
+			    hw->core_stats[i].wb_pct > node->boost_wb_pct) {
 				wb_boost = mult_frac(node->boost_pct,
 						hw->core_stats[i].wb_pct -
 						node->boost_wb_pct,
@@ -279,24 +374,70 @@ static int devfreq_memlat_get_freq(struct devfreq *df,
 			dyn_boost_pct = max3(dyn_boost_pct, stall_boost, wb_boost);
 		}
 
-		if (hw->core_stats[i].stall_pct >= node->pressure_stall_floor ||
-		    hw->core_stats[i].wb_pct >= node->pressure_wb_floor)
-			pressure_seen = true;
+		/*
+		 * Evaluate stall and writeback pressure independently.
+		 * Only valid measurements may extend vote persistence.
+		 */
+		{
+			unsigned int stall_extra = 0;
+			unsigned int wb_extra = 0;
 
-		if (pressure_seen) {
-			unsigned int pressure_delta = max(hw->core_stats[i].stall_pct,
-							  hw->core_stats[i].wb_pct);
-
-			if (pressure_delta > node->pressure_stall_floor) {
-				unsigned int extra = mult_frac(node->perf_increase_pct,
-						pressure_delta - node->pressure_stall_floor,
-						max_t(unsigned int, 1,
-						100 - node->pressure_stall_floor));
-				dyn_persist_pct = max(dyn_persist_pct,
-						      node->min_freq_persist_pct + extra);
+			if (hw->core_stats[i].stall_valid &&
+			    hw->core_stats[i].stall_pct >=
+			    node->pressure_stall_floor) {
+				pressure_seen = true;
+				stall_extra = mult_frac(
+					node->perf_increase_pct,
+					hw->core_stats[i].stall_pct -
+					node->pressure_stall_floor,
+					max_t(unsigned int, 1,
+					100 - node->pressure_stall_floor));
 			}
+
+			if (hw->core_stats[i].wb_valid &&
+			    hw->core_stats[i].wb_pct >=
+			    node->pressure_wb_floor) {
+				pressure_seen = true;
+				wb_extra = mult_frac(
+					node->perf_increase_pct,
+					hw->core_stats[i].wb_pct -
+					node->pressure_wb_floor,
+					max_t(unsigned int, 1,
+					100 - node->pressure_wb_floor));
+			}
+
+			dyn_persist_pct = max(dyn_persist_pct,
+				node->min_freq_persist_pct +
+				max(stall_extra, wb_extra));
 		}
 	}
+
+	if (!valid_sample_seen) {
+		unsigned long now = jiffies;
+
+		if (!node->invalid_pending) {
+			node->invalid_pending = true;
+			node->invalid_since = now;
+			node->invalid_last_decay = now;
+			node->invalid_vote = df->previous_freq;
+		}
+
+		if (time_after_eq(now, node->invalid_since +
+				msecs_to_jiffies(MEMLAT_INVALID_HOLD_MS)) &&
+		    time_after_eq(now, node->invalid_last_decay +
+				msecs_to_jiffies(MEMLAT_INVALID_DECAY_MS))) {
+			if (node->invalid_vote)
+				node->invalid_vote -=
+					max(1UL, node->invalid_vote / 4);
+			node->invalid_last_decay = now;
+		}
+
+		*freq = node->invalid_vote;
+		node->prev_req_freq = *freq;
+		return 0;
+	}
+
+	memlat_reset_invalid(node);
 
 	if (max_freq)
 		max_freq = core_to_dev_freq(node, max_freq);
@@ -515,6 +656,13 @@ static struct memlat_node *register_common(struct device *dev,
 	return node;
 }
 
+static void unregister_failed_memlat_node(struct memlat_node *node)
+{
+	mutex_lock(&list_lock);
+	list_del_init(&node->list);
+	mutex_unlock(&list_lock);
+}
+
 int register_compute(struct device *dev, struct memlat_hwmon *hw)
 {
 	struct memlat_node *node;
@@ -532,6 +680,8 @@ int register_compute(struct device *dev, struct memlat_hwmon *hw)
 		ret = devfreq_add_governor(&devfreq_gov_compute);
 	if (!ret)
 		compute_use_cnt++;
+	else
+		unregister_failed_memlat_node(node);
 	mutex_unlock(&state_lock);
 
 out:
@@ -560,6 +710,8 @@ int register_memlat(struct device *dev, struct memlat_hwmon *hw)
 		ret = devfreq_add_governor(&devfreq_gov_memlat);
 	if (!ret)
 		memlat_use_cnt++;
+	else
+		unregister_failed_memlat_node(node);
 	mutex_unlock(&state_lock);
 
 out:

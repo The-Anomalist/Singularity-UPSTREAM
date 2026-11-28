@@ -128,9 +128,10 @@ static int load_fw_nolock(struct npu_device *npu_dev, bool enable)
 	reinit_completion(&host_ctx->npu_power_up_done);
 	host_ctx->subsystem_handle = subsystem_get_local("npu");
 	if (IS_ERR_OR_NULL(host_ctx->subsystem_handle)) {
-		NPU_ERR("pil load npu fw failed\n");
+		ret = IS_ERR(host_ctx->subsystem_handle) ?
+			PTR_ERR(host_ctx->subsystem_handle) : -ENODEV;
+		NPU_ERR("pil load npu fw failed: %d\n", ret);
 		host_ctx->subsystem_handle = NULL;
-		ret = -ENODEV;
 		goto load_fw_fail;
 	}
 
@@ -195,6 +196,7 @@ load_fw_fail:
 	} else {
 		if (!IS_ERR_OR_NULL(host_ctx->subsystem_handle))
 			subsystem_put_local(host_ctx->subsystem_handle);
+		host_ctx->subsystem_handle = NULL;
 
 		host_ctx->fw_state = FW_UNLOADED;
 	}
@@ -318,7 +320,9 @@ int unload_fw(struct npu_device *npu_dev)
 		return -EBUSY;
 	}
 
-	subsystem_put_local(host_ctx->subsystem_handle);
+	if (!IS_ERR_OR_NULL(host_ctx->subsystem_handle))
+		subsystem_put_local(host_ctx->subsystem_handle);
+	host_ctx->subsystem_handle = NULL;
 	host_ctx->fw_state = FW_UNLOADED;
 	host_ctx->fw_caps_valid = false;
 	host_ctx->fw_caps_err_code = 0;
@@ -350,7 +354,6 @@ static int enable_fw_nolock(struct npu_device *npu_dev)
 		if (host_ctx->auto_pil_disable) {
 			host_ctx->fw_error = false;
 			host_ctx->fw_ref_cnt++;
-			mutex_unlock(&host_ctx->lock);
 			goto enable_log;
 		}
 	}
@@ -535,7 +538,9 @@ static int disable_fw_nolock(struct npu_device *npu_dev)
 	complete(&host_ctx->fw_deinit_done);
 
 	if (host_ctx->auto_pil_disable) {
-		subsystem_put_local(host_ctx->subsystem_handle);
+		if (!IS_ERR_OR_NULL(host_ctx->subsystem_handle))
+			subsystem_put_local(host_ctx->subsystem_handle);
+		host_ctx->subsystem_handle = NULL;
 		host_ctx->fw_state = FW_UNLOADED;
 		NPU_DBG("fw is unloaded\n");
 	}
@@ -693,6 +698,11 @@ static int npu_notifier_cb(struct notifier_block *this, unsigned long code,
 	case SUBSYS_BEFORE_SHUTDOWN:
 	{
 		/* Prepare for unloading fw via PIL */
+		/* vote minimum bandwidth before unload npu fw via PIL */
+		ret = npu_set_ssr_bw(npu_dev, 100, 100);
+		if (ret)
+			NPU_WARN("Can't update bandwidth\n");
+
 		if (host_ctx->fw_state == FW_ENABLED) {
 			/* only happens during subsystem_restart */
 			host_ctx->fw_state = FW_UNLOADED;
@@ -702,15 +712,10 @@ static int npu_notifier_cb(struct notifier_block *this, unsigned long code,
 			npu_notify_aop(npu_dev, false);
 		}
 
-		/* vote minimum bandwidth before unload npu fw via PIL */
-		ret = npu_set_bw(npu_dev, 100, 100);
-		if (ret)
-			NPU_WARN("Can't update bandwidth\n");
-
 		break;
 	}
 	case SUBSYS_AFTER_SHUTDOWN:
-		ret = npu_set_bw(npu_dev, 0, 0);
+		ret = npu_set_ssr_bw(npu_dev, 0, 0);
 		if (ret)
 			NPU_WARN("Can't update bandwidth\n");
 		break;
@@ -789,6 +794,8 @@ int npu_host_update_power(struct npu_device *npu_dev)
 int npu_host_init(struct npu_device *npu_dev)
 {
 	int ret = 0;
+	bool reboot_registered = false;
+	bool panic_registered = false;
 	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
 
 	memset(host_ctx, 0, sizeof(*host_ctx));
@@ -818,6 +825,8 @@ int npu_host_init(struct npu_device *npu_dev)
 		goto fail;
 	}
 
+	reboot_registered = true;
+
 	host_ctx->panic_nb.notifier_call = npu_panic_handler;
 	ret = atomic_notifier_chain_register(&panic_notifier_list,
 		&host_ctx->panic_nb);
@@ -825,6 +834,8 @@ int npu_host_init(struct npu_device *npu_dev)
 		NPU_ERR("register panic notifier failed\n");
 		goto fail;
 	}
+
+	panic_registered = true;
 
 	host_ctx->wq = create_workqueue("npu_general_wq");
 	host_ctx->wq_pri =
@@ -882,6 +893,11 @@ int npu_host_init(struct npu_device *npu_dev)
 	return 0;
 
 fail:
+	if (panic_registered)
+		atomic_notifier_chain_unregister(&panic_notifier_list,
+			&host_ctx->panic_nb);
+	if (reboot_registered)
+		unregister_reboot_notifier(&host_ctx->reboot_nb);
 	kfree(host_ctx->ipc_msg_buf);
 	kmem_cache_destroy(host_ctx->stats_buf_cache);
 	kmem_cache_destroy(host_ctx->network_cmd_cache);
@@ -893,7 +909,6 @@ fail:
 	if (host_ctx->notif_hdle)
 		subsys_notif_unregister_notifier(host_ctx->notif_hdle,
 			&host_ctx->nb);
-	unregister_reboot_notifier(&host_ctx->reboot_nb);
 	mutex_destroy(&host_ctx->lock);
 	return ret;
 }
@@ -902,6 +917,10 @@ void npu_host_deinit(struct npu_device *npu_dev)
 {
 	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
 
+	atomic_notifier_chain_unregister(&panic_notifier_list,
+		&host_ctx->panic_nb);
+	unregister_reboot_notifier(&host_ctx->reboot_nb);
+
 	kfree(host_ctx->ipc_msg_buf);
 	kmem_cache_destroy(host_ctx->stats_buf_cache);
 	kmem_cache_destroy(host_ctx->network_cmd_cache);
@@ -909,7 +928,6 @@ void npu_host_deinit(struct npu_device *npu_dev)
 	destroy_workqueue(host_ctx->wq);
 	destroy_workqueue(host_ctx->wq_pri);
 	subsys_notif_unregister_notifier(host_ctx->notif_hdle, &host_ctx->nb);
-	unregister_reboot_notifier(&host_ctx->reboot_nb);
 	mutex_destroy(&host_ctx->lock);
 }
 
@@ -1106,7 +1124,9 @@ fw_start_done:
 	if (!ret) {
 		host_ctx->fw_state = FW_LOADED;
 	} else {
-		subsystem_put_local(host_ctx->subsystem_handle);
+		if (!IS_ERR_OR_NULL(host_ctx->subsystem_handle))
+			subsystem_put_local(host_ctx->subsystem_handle);
+		host_ctx->subsystem_handle = NULL;
 		host_ctx->fw_state = FW_UNLOADED;
 		host_ctx->wdg_irq_sts = 0;
 		host_ctx->err_irq_sts = 0;
@@ -1246,7 +1266,7 @@ static void turn_off_fw_logging(struct npu_device *npu_dev)
 	struct npu_misc_cmd *misc_cmd = NULL;
 	int ret = 0;
 
-	mutex_lock(&host_ctx->lock);
+	lockdep_assert_held(&host_ctx->lock);
 	log_packet.header.cmd_type = NPU_IPC_CMD_CONFIG_LOG;
 	log_packet.header.size = sizeof(struct ipc_cmd_log_state_pkt);
 	log_packet.header.trans_id =
@@ -1273,7 +1293,6 @@ static void turn_off_fw_logging(struct npu_device *npu_dev)
 		NPU_ERR("npu_host_ipc_send_cmd failed\n");
 
 	npu_free_misc_cmd(host_ctx, misc_cmd);
-	mutex_unlock(&host_ctx->lock);
 }
 
 static int wait_for_status_ready(struct npu_device *npu_dev,

@@ -17,25 +17,7 @@
 	oplus,pcb_range = <0 56>;
 };
 
-/* Optimized GMU frequency for Adreno 650 - increased from 650MHz to 932MHz */
+/* Singularity: experimental fixed GMU 650 MHz. */
 &gmu {
-	qcom,gmu-freq = <932000000>;
-};
-
-/* Enhanced GPU interconnect voting for sustained performance */
-&msm_gpu {
-	qcom,pm-qos-active-latency = <16>;
-	qcom,ca-busy-penalty = <8000>;
-	qcom,ca-target-pwrlevel = <0>;
-	qcom,tz-sample-floor = <4000>;
-	qcom,tz-min-busy = <650>;
-	qcom,tz-busy-ceiling = <32000>;
-	qcom,gpu-icc-bw-avg-kbps =
-		<1 4921875 7812500 10625000 13437500 17343750 21093750
-		 27343750 37500000 43593750 50625000 60937500 71250000 81562500>;
-	qcom,gpu-icc-bw-peak-kbps =
-		<1 19687500 30859375 42031250 52203125 65312500 78437500
-		 101250000 140625000 168750000 206250000 243750000 281250000 329062500>;
-	qcom,gpu-cfg-icc-bw-avg-kbps = <1 128>;
-	qcom,gpu-cfg-icc-bw-peak-kbps = <1 512>;
+	qcom,gmu-freq = <650000000>;
 };

@@ -25,6 +25,9 @@ struct dev_stats {
 	unsigned long mem_count;
 	unsigned long freq;
 	unsigned long stall_pct;
+	bool stall_valid;
+	bool sample_valid;
+	bool wb_valid;
 	unsigned long wb_pct;
 };
 

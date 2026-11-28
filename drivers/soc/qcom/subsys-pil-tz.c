@@ -168,7 +168,6 @@ static struct msm_bus_scale_pdata scm_pas_bus_pdata = {
 };
 
 static uint32_t scm_perf_client;
-static struct icc_path *scm_pas_icc_path;
 static int scm_pas_bw_count;
 static DEFINE_MUTEX(scm_pas_bw_mutex);
 
@@ -176,66 +175,78 @@ static int scm_pas_enable_bw(void)
 {
 	int ret = 0;
 
-	if (!scm_perf_client && !scm_pas_icc_path)
-		return -EINVAL;
-
 	mutex_lock(&scm_pas_bw_mutex);
-	if (!scm_pas_bw_count) {
-		if (scm_pas_icc_path)
-			ret = icc_set_bw(scm_pas_icc_path, 0, 1);
-		else
-			ret = msm_bus_scale_client_update_request(scm_perf_client, 1);
-		if (ret)
-			goto err_bus;
-		scm_pas_bw_count++;
+
+	if (!scm_perf_client) {
+		ret = -ENODEV;
+		goto out;
 	}
 
-	mutex_unlock(&scm_pas_bw_mutex);
-	return ret;
+	if (scm_pas_bw_count == INT_MAX) {
+		ret = -EOVERFLOW;
+		goto out;
+	}
 
-err_bus:
-	pr_err("scm-pas; Bandwidth request failed (%d)\n", ret);
-	if (scm_pas_icc_path)
-		icc_set_bw(scm_pas_icc_path, 0, 0);
-	else
-		msm_bus_scale_client_update_request(scm_perf_client, 0);
+	if (!scm_pas_bw_count) {
+		ret = msm_bus_scale_client_update_request(
+				scm_perf_client, 1);
+		if (ret) {
+			pr_err("scm-pas: Bandwidth request failed (%d)\n",
+			       ret);
+			goto out;
+		}
+	}
 
+	scm_pas_bw_count++;
+out:
 	mutex_unlock(&scm_pas_bw_mutex);
 	return ret;
 }
 
 static void scm_pas_disable_bw(void)
 {
+	int ret;
+
 	mutex_lock(&scm_pas_bw_mutex);
-	if (scm_pas_bw_count-- == 1) {
-		if (scm_pas_icc_path)
-			icc_set_bw(scm_pas_icc_path, 0, 0);
-		else
-			msm_bus_scale_client_update_request(scm_perf_client, 0);
+
+	if (WARN_ON_ONCE(scm_pas_bw_count <= 0))
+		goto out;
+
+	if (--scm_pas_bw_count == 0) {
+		ret = msm_bus_scale_client_update_request(
+				scm_perf_client, 0);
+		if (ret)
+			pr_err("scm-pas: Bandwidth release failed (%d)\n",
+			       ret);
 	}
+
+out:
 	mutex_unlock(&scm_pas_bw_mutex);
 }
 
-static void scm_pas_init(struct device *dev, int id)
+static int scm_pas_init(struct device *dev, int id)
 {
-	static int is_inited;
+	int ret = 0;
 
-	if (is_inited)
-		return;
+	mutex_lock(&scm_pas_bw_mutex);
+
+	if (scm_perf_client)
+		goto out;
 
 	scm_pas_bw_tbl[0].vectors[0].src = id;
 	scm_pas_bw_tbl[1].vectors[0].src = id;
-	scm_pas_icc_path = devm_of_icc_get(dev, "pas-ddr");
-	if (IS_ERR(scm_pas_icc_path))
-		scm_pas_icc_path = devm_of_icc_get(dev, NULL);
-	if (IS_ERR(scm_pas_icc_path))
-		scm_pas_icc_path = NULL;
 
-	scm_perf_client = msm_bus_scale_register_client(&scm_pas_bus_pdata);
-	if (!scm_perf_client && !scm_pas_icc_path)
-		pr_warn("scm-pas: Unable to register bus client\n");
+	scm_perf_client =
+		msm_bus_scale_register_client(&scm_pas_bus_pdata);
 
-	is_inited = 1;
+	if (!scm_perf_client) {
+		dev_dbg(dev, "scm-pas: Physical bus client not ready\n");
+		ret = -EPROBE_DEFER;
+	}
+
+out:
+	mutex_unlock(&scm_pas_bw_mutex);
+	return ret;
 }
 
 static int of_read_clocks(struct device *dev, struct clk ***clks_ref,
@@ -393,9 +404,17 @@ static int of_read_bus_pdata(struct platform_device *pdev,
 		d->bus_client = msm_bus_scale_register_client(pdata);
 #endif
 
-	if (!d->bus_client && !d->bus_icc_path) {
-		pr_warn("%s: Unable to register bus client\n", __func__);
-		return -EINVAL;
+	if (!d->bus_client) {
+#if defined(CONFIG_QCOM_BUS_SCALING)
+		if (!pdata)
+			return -EINVAL;
+
+		dev_dbg(&pdev->dev,
+			"Physical PIL bandwidth backend not ready\n");
+		return -EPROBE_DEFER;
+#else
+		return -EOPNOTSUPP;
+#endif
 	}
 
 	return 0;
@@ -406,29 +425,27 @@ static int do_bus_scaling_request(struct pil_desc *pil, int enable)
 	int rc;
 	struct pil_tz_data *d = desc_to_data(pil);
 
-	if (d->bus_icc_path) {
-		rc = icc_set_bw(d->bus_icc_path, 0, enable ? 1 : 0);
-		if (rc) {
-			dev_err(pil->dev, "ICC bandwidth request failed(rc:%d)\n", rc);
-			return rc;
-		}
-		return 0;
-	}
-
 #if defined(CONFIG_QCOM_BUS_SCALING)
 	if (d->bus_client) {
-		rc = msm_bus_scale_client_update_request(d->bus_client, enable);
-		if (rc) {
-			dev_err(pil->dev, "bandwidth request failed(rc:%d)\n", rc);
-			return rc;
-		}
-		return 0;
+		rc = msm_bus_scale_client_update_request(
+				d->bus_client, enable);
+		if (rc)
+			dev_err(pil->dev,
+				"Physical bandwidth request failed (%d)\n",
+				rc);
+		return rc;
 	}
 #endif
 
-	WARN(d->enable_bus_scaling, "Bus scaling not set up for %s!\n",
-		d->subsys_desc.name);
-	return 0;
+	if (!d->enable_bus_scaling)
+		return 0;
+
+	/*
+	 * The Kona PAS ICC endpoint is currently logical-only.
+	 * Do not report a physical bandwidth vote as successful.
+	 */
+	dev_err(pil->dev, "No physical PIL bandwidth backend\n");
+	return -ENODEV;
 }
 
 static int piltz_resc_init(struct platform_device *pdev, struct pil_tz_data *d)
@@ -603,7 +620,7 @@ static int pil_make_proxy_vote(struct pil_desc *pil)
 	rc = enable_regulators(d, pil->dev, d->proxy_regs,
 					d->proxy_reg_count, false);
 	if (rc)
-		return rc;
+		goto err_bw;
 
 	rc = prepare_enable_clocks(pil->dev, d->proxy_clks,
 							d->proxy_clk_count);
@@ -614,6 +631,8 @@ static int pil_make_proxy_vote(struct pil_desc *pil)
 
 err_clks:
 	disable_regulators(d, d->proxy_regs, d->proxy_reg_count, false);
+err_bw:
+	do_bus_scaling_request(pil, 0);
 
 	return rc;
 }
@@ -721,12 +740,16 @@ static int pil_auth_and_reset(struct pil_desc *pil)
 		return rc;
 
 	rc = enable_regulators(d, pil->dev, d->regs, d->reg_count, false);
-	if (rc)
+	if (rc) {
+		scm_pas_disable_bw();
 		return rc;
+	}
 
 	rc = prepare_enable_clocks(pil->dev, d->clks, d->clk_count);
-	if (rc)
+	if (rc) {
+		scm_pas_disable_bw();
 		goto err_clks;
+	}
 
 	rc = scm_call2(SCM_SIP_FNID(SCM_SVC_PIL,
 		       PAS_AUTH_AND_RESET_CMD), &desc);
@@ -1165,7 +1188,9 @@ static int pil_tz_driver_probe(struct platform_device *pdev)
 				&crypto_id);
 		}
 		of_node_put(crypto_node);
-		scm_pas_init(&pdev->dev, (int)crypto_id);
+		rc = scm_pas_init(&pdev->dev, (int)crypto_id);
+		if (rc)
+			goto err_deregister_bus;
 	}
 
 	rc = pil_desc_init(&d->desc);
@@ -1306,6 +1331,7 @@ err_ramdump:
 	pil_desc_release(&d->desc);
 	platform_set_drvdata(pdev, NULL);
 err_deregister_bus:
+	platform_set_drvdata(pdev, NULL);
 #if defined(CONFIG_QCOM_BUS_SCALING)
 	if (d->bus_client)
 		msm_bus_scale_unregister_client(d->bus_client);
@@ -1322,6 +1348,15 @@ static int pil_tz_driver_exit(struct platform_device *pdev)
 	destroy_ramdump_device(d->ramdump_dev);
 	destroy_ramdump_device(d->minidump_dev);
 	pil_desc_release(&d->desc);
+
+#if defined(CONFIG_QCOM_BUS_SCALING)
+	if (d->bus_client) {
+		msm_bus_scale_unregister_client(d->bus_client);
+		d->bus_client = 0;
+	}
+#endif
+
+	platform_set_drvdata(pdev, NULL);
 
 	return 0;
 }

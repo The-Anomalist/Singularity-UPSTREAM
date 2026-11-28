@@ -379,6 +379,28 @@ static struct clk_core *clk_core_get_parent_by_index(struct clk_core *core,
 	return core->parents[index];
 }
 
+
+/*
+ * Serialize sleepable debug measurement transactions
+ * against CCF topology changes.
+ *
+ * Begin and end must execute in the same task.
+ * Never call from atomic context.
+ */
+void clk_hw_debug_transaction_begin(void)
+{
+	might_sleep();
+	clk_prepare_lock();
+}
+EXPORT_SYMBOL_GPL(clk_hw_debug_transaction_begin);
+
+void clk_hw_debug_transaction_end(void)
+{
+	lockdep_assert_held(&prepare_lock);
+	clk_prepare_unlock();
+}
+EXPORT_SYMBOL_GPL(clk_hw_debug_transaction_end);
+
 struct clk_hw *
 clk_hw_get_parent_by_index(const struct clk_hw *hw, unsigned int index)
 {
@@ -3337,22 +3359,50 @@ static void clk_summary_show_one(struct seq_file *s, struct clk_core *c,
 		   clk_core_get_scaled_duty_cycle(c, 100000));
 }
 
+
+static int clk_debug_vote_get(struct clk_core *core)
+{
+	if (!core->ops->bus_vote)
+		return 0;
+
+	return core->ops->bus_vote(core->hw, true);
+}
+
+static int clk_debug_vote_put(struct clk_core *core)
+{
+	int ret;
+
+	if (!core->ops->bus_vote)
+		return 0;
+
+	ret = core->ops->bus_vote(core->hw, false);
+	if (ret)
+		pr_err_ratelimited("clk: %s: vote release failed: %d\n",
+				   core->name, ret);
+
+	return ret;
+}
+
 static void clk_summary_show_subtree(struct seq_file *s, struct clk_core *c,
 				     int level)
 {
 	struct clk_core *child;
+	int ret;
 
 	if (!c)
 		return;
 
-	if (c->ops->bus_vote)
-		c->ops->bus_vote(c->hw, true);
+	ret = clk_debug_vote_get(c);
+	if (ret) {
+		seq_printf(s, "%*s%s: vote failed (%d)\n",
+			   level * 3 + 1, "", c->name, ret);
+		return;
+	}
 	clk_summary_show_one(s, c, level);
 
 	hlist_for_each_entry(child, &c->children, child_node)
 		clk_summary_show_subtree(s, child, level + 1);
-	if (c->ops->bus_vote)
-		c->ops->bus_vote(c->hw, false);
+	clk_debug_vote_put(c);
 }
 
 static int clk_summary_show(struct seq_file *s, void *data)
@@ -3396,12 +3446,17 @@ static void clk_dump_one(struct seq_file *s, struct clk_core *c, int level)
 static void clk_dump_subtree(struct seq_file *s, struct clk_core *c, int level)
 {
 	struct clk_core *child;
+	int ret;
 
 	if (!c)
 		return;
 
-	if (c->ops->bus_vote)
-		c->ops->bus_vote(c->hw, true);
+	ret = clk_debug_vote_get(c);
+	if (ret) {
+		seq_printf(s, "\"%s\": {\"vote_error\": %d}",
+			   c->name, ret);
+		return;
+	}
 
 	clk_dump_one(s, c, level);
 
@@ -3412,8 +3467,7 @@ static void clk_dump_subtree(struct seq_file *s, struct clk_core *c, int level)
 
 	seq_putc(s, '}');
 
-	if (c->ops->bus_vote)
-		c->ops->bus_vote(c->hw, false);
+	clk_debug_vote_put(c);
 }
 
 static int clk_dump_show(struct seq_file *s, void *data)
@@ -3511,19 +3565,22 @@ DEFINE_SHOW_ATTRIBUTE(clk_duty_cycle);
 static int clock_debug_rate_set(void *data, u64 val)
 {
 	struct clk_core *core = data;
-	int ret;
+	int ret, release_ret;
 
 	clk_prepare_lock();
-	if (core->ops->bus_vote)
-		core->ops->bus_vote(core->hw, true);
+	ret = clk_debug_vote_get(core);
+	if (ret)
+		goto unlock;
 
 	ret = clk_set_rate(core->hw->clk, val);
 	if (ret)
 		pr_err("clk_set_rate(%lu) failed (%d)\n",
 				(unsigned long)val, ret);
 
-	if (core->ops->bus_vote)
-		core->ops->bus_vote(core->hw, false);
+	release_ret = clk_debug_vote_put(core);
+	if (!ret)
+		ret = release_ret;
+unlock:
 	clk_prepare_unlock();
 
 	return ret;
@@ -3532,18 +3589,20 @@ static int clock_debug_rate_set(void *data, u64 val)
 static int clock_debug_rate_get(void *data, u64 *val)
 {
 	struct clk_core *core = data;
+	int ret;
 
 	clk_prepare_lock();
-	if (core->ops->bus_vote)
-		core->ops->bus_vote(core->hw, true);
+	ret = clk_debug_vote_get(core);
+	if (ret)
+		goto unlock;
 
 	*val = clk_get_rate(core->hw->clk);
 
-	if (core->ops->bus_vote)
-		core->ops->bus_vote(core->hw, false);
+	ret = clk_debug_vote_put(core);
+unlock:
 	clk_prepare_unlock();
 
-	return 0;
+	return ret;
 }
 
 DEFINE_DEBUGFS_ATTRIBUTE(clock_rate_fops, clock_debug_rate_get,
@@ -3569,19 +3628,22 @@ static const struct file_operations clock_parent_fops = {
 static int clock_debug_enable_set(void *data, u64 val)
 {
 	struct clk_core *core = data;
-	int rc = 0;
+	int rc = 0, release_ret;
 
 	clk_prepare_lock();
-	if (core->ops->bus_vote)
-		core->ops->bus_vote(core->hw, true);
+	rc = clk_debug_vote_get(core);
+	if (rc)
+		goto unlock;
 
 	if (val)
 		rc = clk_prepare_enable(core->hw->clk);
 	else
 		clk_disable_unprepare(core->hw->clk);
 
-	if (core->ops->bus_vote)
-		core->ops->bus_vote(core->hw, false);
+	release_ret = clk_debug_vote_put(core);
+	if (!rc)
+		rc = release_ret;
+unlock:
 	clk_prepare_unlock();
 
 	return rc;
@@ -3708,21 +3770,30 @@ EXPORT_SYMBOL(clk_debug_print_hw);
 static int print_hw_show(struct seq_file *m, void *unused)
 {
 	struct clk_core *c = m->private;
-	struct clk_core *clk;
+	struct clk_core *clk, *failed = NULL;
+	int ret = 0, release_ret;
 
 	clk_prepare_lock();
-	for (clk = c; clk; clk = clk->parent)
-		if (clk->ops->bus_vote)
-			clk->ops->bus_vote(clk->hw, true);
+
+	for (clk = c; clk; clk = clk->parent) {
+		ret = clk_debug_vote_get(clk);
+		if (ret) {
+			failed = clk;
+			goto release;
+		}
+	}
 
 	clk_debug_print_hw(c, m);
 
-	for (clk = c; clk; clk = clk->parent)
-		if (clk->ops->bus_vote)
-			clk->ops->bus_vote(c->hw, false);
-	clk_prepare_unlock();
+release:
+	for (clk = c; clk && clk != failed; clk = clk->parent) {
+		release_ret = clk_debug_vote_put(clk);
+		if (!ret)
+			ret = release_ret;
+	}
 
-	return 0;
+	clk_prepare_unlock();
+	return ret;
 }
 
 static int print_hw_open(struct inode *inode, struct file *file)
@@ -3966,11 +4037,15 @@ static void clk_debug_register(struct clk_core *core)
  */
 static void clk_debug_unregister(struct clk_core *core)
 {
+	struct dentry *dentry;
+
 	mutex_lock(&clk_debug_lock);
 	hlist_del_init(&core->debug_node);
-	debugfs_remove_recursive(core->dentry);
+	dentry = core->dentry;
 	core->dentry = NULL;
 	mutex_unlock(&clk_debug_lock);
+
+	debugfs_remove_recursive(dentry);
 }
 
 /*
