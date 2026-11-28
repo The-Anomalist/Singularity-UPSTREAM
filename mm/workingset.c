@@ -245,6 +245,8 @@ static void lru_gen_refault(struct page *page, void *shadow)
 	struct lru_gen_struct *lrugen;
 
 	unpack_shadow(shadow, &memcgid, &pgdat, &token, &workingset);
+	/* MGLRU tokens encode generations and refs, not timestamps. */
+	token >>= bucket_order;
 	if (pgdat != page_pgdat(page))
 		return;
 	rcu_read_lock();
@@ -253,6 +255,7 @@ static void lru_gen_refault(struct page *page, void *shadow)
 		goto out;
 	lruvec = mem_cgroup_lruvec(pgdat, memcg);
 	lrugen = &lruvec->lrugen;
+	mod_lruvec_state(lruvec, WORKINGSET_REFAULT, thp_nr_pages(page));
 	min_seq = READ_ONCE(lrugen->min_seq[type]);
 	if ((token >> LRU_REFS_WIDTH) !=
 	    (min_seq & (EVICTION_MASK >> LRU_REFS_WIDTH)))
@@ -261,13 +264,62 @@ static void lru_gen_refault(struct page *page, void *shadow)
 	tier = lru_tier_from_refs(refs);
 	hist = lru_hist_from_seq(min_seq);
 	atomic_long_add(thp_nr_pages(page), &lrugen->refaulted[hist][type][tier]);
-	mod_lruvec_state(lruvec, WORKINGSET_REFAULT, thp_nr_pages(page));
-	if (lru_gen_in_fault() || refs == BIT(LRU_REFS_WIDTH))
+	mod_lruvec_state(lruvec, WORKINGSET_ACTIVATE, thp_nr_pages(page));
+	if (lru_gen_in_fault() || refs == BIT(LRU_REFS_WIDTH)) {
 		SetPageWorkingset(page);
+		mod_lruvec_state(lruvec, WORKINGSET_RESTORE, thp_nr_pages(page));
+	}
 out:
 	rcu_read_unlock();
 }
+
+void *workingset_anon_eviction(struct page *page)
+{
+	if (!lru_gen_enabled())
+		return NULL;
+
+	if (!mem_cgroup_disabled() && !page_memcg(page))
+		return NULL;
+
+	return lru_gen_eviction(page);
+}
+
+void workingset_anon_refault(struct page *page, void *shadow)
+{
+	if (!shadow || !lru_gen_enabled())
+		return;
+
+	if (!mem_cgroup_disabled() && !page_memcg(page))
+		return;
+
+	lru_gen_refault(page, shadow);
+}
 #endif
+
+/*
+ * Age nonresident entries in the local LRU and its
+ * accounting ancestors.
+ */
+void workingset_age_nonresident(struct lruvec *lruvec,
+                               unsigned long nr_pages)
+{
+#ifdef CONFIG_MEMCG
+	struct mem_cgroup *memcg;
+	struct pglist_data *pgdat;
+
+	memcg = lruvec_memcg(lruvec);
+	pgdat = lruvec_pgdat(lruvec);
+
+	atomic_long_add(nr_pages, &lruvec->inactive_age);
+
+	while (memcg && (memcg = parent_mem_cgroup(memcg))) {
+		lruvec = mem_cgroup_lruvec(pgdat, memcg);
+		atomic_long_add(nr_pages, &lruvec->inactive_age);
+	}
+#else
+	atomic_long_add(nr_pages, &lruvec->inactive_age);
+#endif
+}
 
 /**
  * workingset_eviction - note the eviction of a page from memory
@@ -295,7 +347,8 @@ void *workingset_eviction(struct address_space *mapping, struct page *page)
 	if (lru_gen_enabled())
 		return lru_gen_eviction(page);
 #endif
-	eviction = atomic_long_inc_return(&lruvec->inactive_age);
+	workingset_age_nonresident(lruvec, thp_nr_pages(page));
+	eviction = atomic_long_read(&lruvec->inactive_age);
 	return pack_shadow(memcgid, pgdat, eviction, PageWorkingset(page));
 }
 
@@ -380,7 +433,7 @@ void workingset_refault(struct page *page, void *shadow)
 		goto out;
 
 	SetPageActive(page);
-	atomic_long_inc(&lruvec->inactive_age);
+	workingset_age_nonresident(lruvec, thp_nr_pages(page));
 	inc_lruvec_state(lruvec, WORKINGSET_ACTIVATE);
 
 	/* Page was active prior to eviction */
@@ -413,7 +466,7 @@ void workingset_activation(struct page *page)
 	if (!mem_cgroup_disabled() && !memcg)
 		goto out;
 	lruvec = mem_cgroup_lruvec(page_pgdat(page), memcg);
-	atomic_long_inc(&lruvec->inactive_age);
+	workingset_age_nonresident(lruvec, thp_nr_pages(page));
 out:
 	rcu_read_unlock();
 }

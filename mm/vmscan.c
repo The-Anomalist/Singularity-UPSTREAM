@@ -999,6 +999,21 @@ static int __remove_mapping(struct address_space *mapping, struct page *page,
 
 	if (PageSwapCache(page)) {
 		swp_entry_t swap = { .val = page_private(page) };
+
+#ifdef CONFIG_LRU_GEN
+		/*
+		 * Capture anonymous eviction feedback before swapout
+		 * releases the original memory cgroup ownership.
+		 */
+		if (reclaimed && lru_gen_enabled() &&
+		    PageAnon(page) && !PageTransHuge(page) &&
+		    !mapping_exiting(mapping)) {
+			void *shadow = workingset_anon_eviction(page);
+
+			if (shadow)
+				swap_refault_store(swap, shadow);
+		}
+#endif
 		mem_cgroup_swapout(page, swap);
 		__delete_from_swap_cache(page);
 		xa_unlock_irqrestore(&mapping->i_pages, flags);
@@ -2046,6 +2061,8 @@ putback_inactive_pages(struct lruvec *lruvec, struct list_head *page_list)
 				spin_lock_irq(&pgdat->lru_lock);
 			} else
 				list_add(&page->lru, &pages_to_free);
+		} else if (PageActive(page)) {
+			workingset_age_nonresident(lruvec, hpage_nr_pages(page));
 		}
 	}
 

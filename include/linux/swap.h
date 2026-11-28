@@ -310,6 +310,8 @@ struct vma_swap_readahead {
 };
 
 /* linux/mm/workingset.c */
+void workingset_age_nonresident(struct lruvec *lruvec,
+				 unsigned long nr_pages);
 void *workingset_eviction(struct address_space *mapping, struct page *page);
 void workingset_refault(struct page *page, void *shadow);
 void workingset_activation(struct page *page);
@@ -408,6 +410,10 @@ int generic_swapfile_activate(struct swap_info_struct *, struct file *,
 #define SWAP_ADDRESS_SPACE_SHIFT	14
 #define SWAP_ADDRESS_SPACE_PAGES	(1 << SWAP_ADDRESS_SPACE_SHIFT)
 extern struct address_space *swapper_spaces[];
+extern void clear_shadow_from_swap_cache(int type,
+					unsigned long begin,
+					unsigned long end);
+
 #define swap_address_space(entry)			    \
 	(&swapper_spaces[swp_type(entry)][swp_offset(entry) \
 		>> SWAP_ADDRESS_SPACE_SHIFT])
@@ -415,8 +421,14 @@ extern unsigned long total_swapcache_pages(void);
 extern void show_swap_cache_info(void);
 extern int add_to_swap(struct page *page);
 extern int add_to_swap_cache(struct page *, swp_entry_t, gfp_t);
-extern int __add_to_swap_cache(struct page *page, swp_entry_t entry);
 extern void __delete_from_swap_cache(struct page *);
+#ifdef CONFIG_LRU_GEN
+extern void *workingset_anon_eviction(struct page *page);
+extern void workingset_anon_refault(struct page *page, void *shadow);
+extern bool swap_refault_store(swp_entry_t entry, void *shadow);
+extern void *swap_refault_take(swp_entry_t entry);
+#endif
+extern void __delete_from_swap_cache_shadow(struct page *page, void *shadow);
 extern void delete_from_swap_cache(struct page *);
 extern void free_page_and_swap_cache(struct page *);
 extern void free_pages_and_swap_cache(struct page **, int);

@@ -39,6 +39,51 @@ static const struct address_space_operations swap_aops = {
 
 struct address_space *swapper_spaces[MAX_SWAPFILES] __read_mostly;
 static unsigned int nr_swapper_spaces[MAX_SWAPFILES] __read_mostly;
+#ifdef CONFIG_LRU_GEN
+static struct xarray swap_refault_tokens[MAX_SWAPFILES];
+#endif
+
+#ifdef CONFIG_LRU_GEN
+/*
+ * Deferred anonymous refault tokens.
+ * Callers must guarantee swap-slot lifetime and ownership.
+ */
+bool swap_refault_store(swp_entry_t entry, void *shadow)
+{
+	struct xarray *xa;
+	unsigned long flags;
+	void *old;
+
+	if (!shadow || !xa_is_value(shadow))
+		return false;
+
+	xa = &swap_refault_tokens[swp_type(entry)];
+
+	xa_lock_irqsave(xa, flags);
+	old = __xa_store(xa, swp_offset(entry), shadow,
+			 GFP_NOWAIT | __GFP_NOWARN);
+	xa_unlock_irqrestore(xa, flags);
+
+	return !xa_err(old);
+}
+
+void *swap_refault_take(swp_entry_t entry)
+{
+	struct xarray *xa;
+	unsigned long flags;
+	void *shadow;
+
+	xa = &swap_refault_tokens[swp_type(entry)];
+
+	xa_lock_irqsave(xa, flags);
+	shadow = __xa_erase(xa, swp_offset(entry));
+	xa_unlock_irqrestore(xa, flags);
+
+	return xa_is_value(shadow) ? shadow : NULL;
+}
+
+#endif
+
 static bool enable_vma_readahead __read_mostly = true;
 
 #define SWAP_RA_WIN_SHIFT	(PAGE_SHIFT / 2)
@@ -108,14 +153,17 @@ void show_swap_cache_info(void)
 }
 
 /*
- * __add_to_swap_cache resembles add_to_page_cache_locked on swapper_space,
+ * add_to_swap_cache resembles add_to_page_cache_locked on swapper_space,
  * but sets SwapCache flag and private instead of mapping and index.
  */
-int __add_to_swap_cache(struct page *page, swp_entry_t entry)
+int add_to_swap_cache(struct page *page, swp_entry_t entry,
+                      gfp_t gfp_mask)
 {
-	int error, i, nr = hpage_nr_pages(page);
-	struct address_space *address_space;
+	struct address_space *address_space = swap_address_space(entry);
 	pgoff_t idx = swp_offset(entry);
+	XA_STATE_ORDER(xas, &address_space->i_pages, idx,
+		       compound_order(page));
+	int i, nr = hpage_nr_pages(page);
 
 	VM_BUG_ON_PAGE(!PageLocked(page), page);
 	VM_BUG_ON_PAGE(PageSwapCache(page), page);
@@ -124,57 +172,56 @@ int __add_to_swap_cache(struct page *page, swp_entry_t entry)
 	page_ref_add(page, nr);
 	SetPageSwapCache(page);
 
-	address_space = swap_address_space(entry);
-	xa_lock_irq(&address_space->i_pages);
-	for (i = 0; i < nr; i++) {
-		set_page_private(page + i, entry.val + i);
-		error = radix_tree_insert(&address_space->i_pages,
-					  idx + i, page + i);
-		if (unlikely(error))
-			break;
-	}
-	if (likely(!error)) {
-		address_space->nrpages += nr;
-		__mod_node_page_state(page_pgdat(page), NR_FILE_PAGES, nr);
-		ADD_CACHE_INFO(add_total, nr);
-	} else {
+	do {
+		unsigned long nr_shadows = 0;
+
+		xas_lock_irq(&xas);
+		xas_create_range(&xas);
+		if (xas_error(&xas))
+			goto unlock;
+
 		/*
-		 * Only the context which have set SWAP_HAS_CACHE flag
-		 * would call add_to_swap_cache().
-		 * So add_to_swap_cache() doesn't returns -EEXIST.
+		 * SWAP_HAS_CACHE grants exclusive insertion ownership.
+		 * Exceptional entries may be replaced by resident pages.
 		 */
-		VM_BUG_ON(error == -EEXIST);
-		set_page_private(page + i, 0UL);
-		while (i--) {
-			radix_tree_delete(&address_space->i_pages, idx + i);
-			set_page_private(page + i, 0UL);
+		for (i = 0; i < nr; i++) {
+			void *old_entry;
+
+			VM_BUG_ON_PAGE(xas.xa_index != idx + i, page);
+
+			old_entry = xas_load(&xas);
+			VM_BUG_ON_PAGE(old_entry &&
+				       !xa_is_value(old_entry), page);
+			if (xa_is_value(old_entry))
+				nr_shadows++;
+
+			set_page_private(page + i, entry.val + i);
+			xas_store(&xas, page + i);
+			xas_next(&xas);
 		}
-		ClearPageSwapCache(page);
-		page_ref_sub(page, nr);
-	}
-	xa_unlock_irq(&address_space->i_pages);
 
-	return error;
-}
+		address_space->nrexceptional -= nr_shadows;
+		address_space->nrpages += nr;
+		__mod_node_page_state(page_pgdat(page),
+				      NR_FILE_PAGES, nr);
+		ADD_CACHE_INFO(add_total, nr);
+unlock:
+		xas_unlock_irq(&xas);
+	} while (xas_nomem(&xas, gfp_mask));
 
+	if (!xas_error(&xas))
+		return 0;
 
-int add_to_swap_cache(struct page *page, swp_entry_t entry, gfp_t gfp_mask)
-{
-	int error;
-
-	error = radix_tree_maybe_preload_order(gfp_mask, compound_order(page));
-	if (!error) {
-		error = __add_to_swap_cache(page, entry);
-		radix_tree_preload_end();
-	}
-	return error;
+	ClearPageSwapCache(page);
+	page_ref_sub(page, nr);
+	return xas_error(&xas);
 }
 
 /*
  * This must be called only on pages that have
  * been verified to be in the swap cache.
  */
-void __delete_from_swap_cache(struct page *page)
+void __delete_from_swap_cache_shadow(struct page *page, void *shadow)
 {
 	struct address_space *address_space;
 	int i, nr = hpage_nr_pages(page);
@@ -184,19 +231,37 @@ void __delete_from_swap_cache(struct page *page)
 	VM_BUG_ON_PAGE(!PageLocked(page), page);
 	VM_BUG_ON_PAGE(!PageSwapCache(page), page);
 	VM_BUG_ON_PAGE(PageWriteback(page), page);
+	VM_BUG_ON(shadow && !xa_is_value(shadow));
 
 	entry.val = page_private(page);
 	address_space = swap_address_space(entry);
 	idx = swp_offset(entry);
-	for (i = 0; i < nr; i++) {
-		radix_tree_delete(&address_space->i_pages, idx + i);
-		set_page_private(page + i, 0);
+
+	{
+		XA_STATE(xas, &address_space->i_pages, idx);
+
+		for (i = 0; i < nr; i++) {
+			void *old = xas_store(&xas, shadow);
+
+			VM_BUG_ON_PAGE(old != page + i, page);
+			set_page_private(page + i, 0);
+			xas_next(&xas);
+		}
 	}
+
 	ClearPageSwapCache(page);
+	if (shadow)
+		address_space->nrexceptional += nr;
 	address_space->nrpages -= nr;
 	__mod_node_page_state(page_pgdat(page), NR_FILE_PAGES, -nr);
 	ADD_CACHE_INFO(del_total, nr);
 }
+
+void __delete_from_swap_cache(struct page *page)
+{
+	__delete_from_swap_cache_shadow(page, NULL);
+}
+
 
 /**
  * add_to_swap - allocate swap space for a page
@@ -414,19 +479,12 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 				break;		/* Out of memory */
 		}
 
-		/*
-		 * call radix_tree_preload() while we can wait.
-		 */
-		err = radix_tree_maybe_preload(gfp_mask & GFP_RECLAIM_MASK);
-		if (err)
-			break;
 
 		/*
 		 * Swap entry may have been freed since our caller observed it.
 		 */
 		err = swapcache_prepare(entry);
 		if (err == -EEXIST) {
-			radix_tree_preload_end();
 			/*
 			 * We might race against get_swap_page() and stumble
 			 * across a SWAP_HAS_CACHE swap_map entry whose page
@@ -436,16 +494,15 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 			continue;
 		}
 		if (err) {		/* swp entry is obsolete ? */
-			radix_tree_preload_end();
 			break;
 		}
 
-		/* May fail (-ENOMEM) if radix-tree node allocation failed. */
+		/* May fail (-ENOMEM) if XArray node allocation failed. */
 		__SetPageLocked(new_page);
 		__SetPageSwapBacked(new_page);
-		err = __add_to_swap_cache(new_page, entry);
+		err = add_to_swap_cache(new_page, entry,
+					gfp_mask & GFP_RECLAIM_MASK);
 		if (likely(!err)) {
-			radix_tree_preload_end();
 			/*
 			 * Initiate read into locked page and return.
 			 */
@@ -454,7 +511,6 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 			*new_page_allocated = true;
 			return new_page;
 		}
-		radix_tree_preload_end();
 		__ClearPageLocked(new_page);
 		/*
 		 * add_to_swap_cache() doesn't return -EEXIST, so we can safely
@@ -617,6 +673,53 @@ skip:
 	return read_swap_cache_async(entry, gfp_mask, vma, addr, do_poll);
 }
 
+
+/*
+ * Remove exceptional swap-cache entries before their slots can be reused.
+ * Resident pages must never be removed by this path.
+ */
+void clear_shadow_from_swap_cache(int type, unsigned long begin,
+                                  unsigned long end)
+{
+	while (begin <= end) {
+		swp_entry_t entry = swp_entry(type, begin);
+		struct address_space *mapping = swap_address_space(entry);
+		unsigned long last;
+		unsigned long flags;
+		void *shadow;
+		XA_STATE(xas, &mapping->i_pages, begin);
+
+		last = min(end, begin | (SWAP_ADDRESS_SPACE_PAGES - 1UL));
+
+		xas_lock_irqsave(&xas, flags);
+		xas_for_each(&xas, shadow, last) {
+			if (!xa_is_value(shadow))
+				continue;
+
+			xas_store(&xas, NULL);
+			mapping->nrexceptional--;
+		}
+		xas_unlock_irqrestore(&xas, flags);
+
+#ifdef CONFIG_LRU_GEN
+		{
+			XA_STATE(tokens, &swap_refault_tokens[type], begin);
+			void *token;
+
+			xas_lock_irqsave(&tokens, flags);
+			xas_for_each(&tokens, token, last)
+				xas_store(&tokens, NULL);
+			xas_unlock_irqrestore(&tokens, flags);
+		}
+#endif
+
+		if (last == end)
+			break;
+
+		begin = last + 1;
+	}
+}
+
 int init_swap_address_space(unsigned int type, unsigned long nr_pages)
 {
 	struct address_space *spaces, *space;
@@ -634,6 +737,9 @@ int init_swap_address_space(unsigned int type, unsigned long nr_pages)
 		/* swap cache doesn't use writeback related tags */
 		mapping_set_no_writeback_tags(space);
 	}
+#ifdef CONFIG_LRU_GEN
+	xa_init_flags(&swap_refault_tokens[type], XA_FLAGS_LOCK_IRQ);
+#endif
 	nr_swapper_spaces[type] = nr;
 	rcu_assign_pointer(swapper_spaces[type], spaces);
 
@@ -643,11 +749,23 @@ int init_swap_address_space(unsigned int type, unsigned long nr_pages)
 void exit_swap_address_space(unsigned int type)
 {
 	struct address_space *spaces;
+	unsigned int i, nr;
 
 	spaces = swapper_spaces[type];
+	nr = nr_swapper_spaces[type];
 	nr_swapper_spaces[type] = 0;
 	rcu_assign_pointer(swapper_spaces[type], NULL);
 	synchronize_rcu();
+
+#ifdef CONFIG_LRU_GEN
+	xa_destroy(&swap_refault_tokens[type]);
+#endif
+
+	for (i = 0; i < nr; i++) {
+		WARN_ON_ONCE(spaces[i].nrpages);
+		xa_destroy(&spaces[i].i_pages);
+	}
+
 	kvfree(spaces);
 }
 

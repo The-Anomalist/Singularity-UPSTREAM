@@ -2860,6 +2860,9 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	swp_entry_t entry;
 	struct swap_info_struct *si;
 	bool skip_swapcache = false;
+#ifdef CONFIG_LRU_GEN
+	void *refault_shadow = NULL;
+#endif
 	pte_t pte;
 	int locked;
 	int exclusive = 0;
@@ -3006,6 +3009,15 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	 * must be called after the swap_free(), or it will never succeed.
 	 */
 
+#ifdef CONFIG_LRU_GEN
+	/*
+	 * The original PTE and page have been validated.
+	 * Consume feedback before reuse_swap_page() can
+	 * detach the page from its swap entry.
+	 */
+	refault_shadow = swap_refault_take(entry);
+#endif
+
 	inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
 	dec_mm_counter_fast(vma->vm_mm, MM_SWAPENTS);
 	pte = mk_pte(page, vmf->vma_page_prot);
@@ -3030,6 +3042,9 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	} else {
 		do_page_add_anon_rmap(page, vma, vmf->address, exclusive);
 		mem_cgroup_commit_charge(page, memcg, true, false);
+#ifdef CONFIG_LRU_GEN
+		workingset_anon_refault(page, refault_shadow);
+#endif
 		activate_page(page);
 	}
 
